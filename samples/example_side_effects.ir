@@ -1,0 +1,11 @@
+# Example 2: memory + I/O side effects create safe reorder barriers
+# Expected printed value: 21
+
+x = 4
+y = 9
+tmp1 = x + y
+store mem0, tmp1
+tmp2 = x * 2
+load tmp3, mem0
+tmp4 = tmp2 + tmp3
+print tmp4

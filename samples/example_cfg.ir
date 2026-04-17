@@ -1,0 +1,15 @@
+# Example 4: control flow with loop and branches (CFG demo)
+# Expected printed value: 15
+
+i = 1
+sum = 0
+
+L_loop:
+if i > 5 goto L_end
+t = sum + i
+sum = t
+i = i + 1
+goto L_loop
+
+L_end:
+print sum

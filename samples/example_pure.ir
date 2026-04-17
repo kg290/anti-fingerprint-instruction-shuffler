@@ -1,0 +1,12 @@
+# Example 1: mostly pure arithmetic, high shuffling freedom
+# Expected printed value: 63
+
+a = 5
+b = 7
+t1 = a + b
+t2 = a * b
+t3 = t1 + t2
+u1 = b - a
+u2 = u1 * 8
+result = t3 + u2
+print result

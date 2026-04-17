@@ -1,0 +1,15 @@
+# Example 3: arithmetic + call + memory + output
+# Expected printed value: 24
+
+a = 3
+b = 8
+c = a + b
+d = b * 2
+e = d - a
+call max c e -> m
+store slot0, m
+f = 10
+g = f + a
+load h, slot0
+out = h + g
+print out

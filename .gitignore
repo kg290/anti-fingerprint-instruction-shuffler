@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+
+# Object and binary files
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
