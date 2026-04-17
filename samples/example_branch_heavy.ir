@@ -1,0 +1,15 @@
+# Example 5: richer arithmetic + branch + bitwise operators
+# Expected printed value: 101
+
+a = 42
+b = 5
+c = a % b
+d = c * 3
+e = d ^ 7
+if e > 10 goto L_hi
+f = e + 100
+goto L_end
+L_hi:
+f = e - 2
+L_end:
+print f
