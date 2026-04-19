@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -32,6 +33,8 @@ struct Options {
     std::uint64_t seed = 0;
     bool verify = false;
     bool showMap = false;
+    bool cleanOutputDir = false;
+    bool fixedSeedAcrossRuns = false;
 
     bool interactive = false;
 
@@ -40,10 +43,12 @@ struct Options {
 
     std::string reportPath;
     std::string reportHtmlPath;
+    std::string outputDir;
 
     std::string envPath = ".env";
 
     bool forceCppInput = false;
+    int runs = 1;
     bool preferLlmCpp = true;
 };
 
@@ -133,14 +138,18 @@ bool IsCppFilePath(const std::string& path) {
 void PrintUsage(const char* exe) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << exe
-              << " --input <file> [--output <file>] [--seed <u64>] [--verify] [--show-map]\n";
+              << " --input <file> [--output <file>] [--seed <u64>] [--verify] [--show-map] [--runs <n>]\n";
     std::cerr << "  " << exe << " --interactive [--env <file>]\n\n";
 
     std::cerr << "Core options:\n";
     std::cerr << "  --input, -i <file>      Input file (.ir or .cpp)\n";
     std::cerr << "  --input-cpp <file>      Force C++ input mode (experimental)\n";
     std::cerr << "  --output, -o <file>     Output transformed IR file\n";
+    std::cerr << "  --output-dir <dir>      Output directory for batch mode (--runs > 1)\n";
     std::cerr << "  --seed <u64>            Fixed seed for deterministic runs\n";
+    std::cerr << "  --runs <n>              Run transformation n times in one command\n";
+    std::cerr << "  --fixed-seed-runs       Reuse exactly the same seed for each batch run\n";
+    std::cerr << "  --clean-output-dir      Clear --output-dir before batch run\n";
     std::cerr << "  --verify                Execute original and transformed IR and compare output\n";
     std::cerr << "  --show-map              Print rename map\n";
     std::cerr << "  --interactive           Start loop-based interactive mode\n";
@@ -157,6 +166,10 @@ void PrintUsage(const char* exe) {
     std::cerr << "  " << exe
               << " --input samples/example_full.ir --output build/out.ir --verify\n";
     std::cerr << "  " << exe
+              << " --input samples/example_full.ir --output build/out.ir --runs 2 --verify\n";
+    std::cerr << "  " << exe
+              << " --input samples/example_full.ir --output-dir build/demo_runs --runs 3 --verify --clean-output-dir\n";
+    std::cerr << "  " << exe
               << " --input samples/example_cpp_basic.cpp --output build/from_cpp.ir --verify --llm-explain\n";
     std::cerr << "  " << exe
               << " --input samples/example_full.ir --output build/sub.ir --llm-substitute --verify\n";
@@ -171,6 +184,20 @@ bool ParseU64(const std::string& text, std::uint64_t& out) {
             return false;
         }
         out = static_cast<std::uint64_t>(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool ParsePositiveInt(const std::string& text, int& out) {
+    try {
+        std::size_t idx = 0;
+        long value = std::stol(text, &idx, 10);
+        if (idx != text.size() || value <= 0 || value > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        out = static_cast<int>(value);
         return true;
     } catch (...) {
         return false;
@@ -215,6 +242,15 @@ bool ParseArgs(int argc,
             continue;
         }
 
+        if (arg == "--output-dir") {
+            if (i + 1 >= argc) {
+                error = "Missing value for --output-dir";
+                return false;
+            }
+            options.outputDir = argv[++i];
+            continue;
+        }
+
         if (arg == "--seed") {
             if (i + 1 >= argc) {
                 error = "Missing value for --seed";
@@ -227,6 +263,30 @@ bool ParseArgs(int argc,
             }
             options.hasSeed = true;
             options.seed = parsed;
+            continue;
+        }
+
+        if (arg == "--runs") {
+            if (i + 1 >= argc) {
+                error = "Missing value for --runs";
+                return false;
+            }
+            int parsedRuns = 1;
+            if (!ParsePositiveInt(argv[++i], parsedRuns)) {
+                error = "Invalid --runs value: " + std::string(argv[i]);
+                return false;
+            }
+            options.runs = parsedRuns;
+            continue;
+        }
+
+        if (arg == "--fixed-seed-runs") {
+            options.fixedSeedAcrossRuns = true;
+            continue;
+        }
+
+        if (arg == "--clean-output-dir") {
+            options.cleanOutputDir = true;
             continue;
         }
 
@@ -301,6 +361,21 @@ bool ParseArgs(int argc,
         return false;
     }
 
+    if (options.runs <= 0) {
+        error = "--runs must be >= 1";
+        return false;
+    }
+
+    if (options.interactive && options.runs > 1) {
+        error = "--runs cannot be combined with --interactive";
+        return false;
+    }
+
+    if (options.cleanOutputDir && options.outputDir.empty()) {
+        error = "--clean-output-dir requires --output-dir";
+        return false;
+    }
+
     return true;
 }
 
@@ -325,6 +400,21 @@ std::uint64_t HashText(const std::string& text) {
 }
 
 bool WriteTextFile(const std::string& path, const std::string& content, std::string& error) {
+    try {
+        std::filesystem::path outPath(path);
+        std::filesystem::path parent = outPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+    } catch (const std::exception& ex) {
+        error = std::string("Could not prepare output directory for file: ") + path + " (" +
+                ex.what() + ")";
+        return false;
+    } catch (...) {
+        error = "Could not prepare output directory for file: " + path;
+        return false;
+    }
+
     std::ofstream out(path);
     if (!out) {
         error = "Could not write output file: " + path;
@@ -1422,6 +1512,156 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     return exitCode;
 }
 
+std::string BuildBatchOutputPath(const Options& options, int runIndex) {
+    if (options.runs <= 1) {
+        return options.outputPath;
+    }
+
+    if (!options.outputDir.empty()) {
+        std::filesystem::path dir(options.outputDir);
+        std::ostringstream fileName;
+        fileName << "run_" << runIndex << ".ir";
+        return (dir / fileName.str()).string();
+    }
+
+    std::filesystem::path outputPath(options.outputPath);
+    std::filesystem::path parent = outputPath.parent_path();
+    std::string stem = outputPath.stem().string();
+    std::string ext = outputPath.extension().string();
+
+    if (stem.empty()) {
+        stem = "transformed";
+    }
+    if (ext.empty()) {
+        ext = ".ir";
+    }
+
+    std::ostringstream fileName;
+    fileName << stem << "_run_" << runIndex << ext;
+    if (parent.empty()) {
+        return fileName.str();
+    }
+    return (parent / fileName.str()).string();
+}
+
+bool PrepareBatchOutputArea(const Options& options, std::string& error) {
+    if (options.runs <= 1 || options.outputDir.empty()) {
+        return true;
+    }
+
+    try {
+        std::filesystem::path dir(options.outputDir);
+        if (options.cleanOutputDir && std::filesystem::exists(dir)) {
+            std::filesystem::remove_all(dir);
+        }
+        std::filesystem::create_directories(dir);
+        return true;
+    } catch (const std::exception& ex) {
+        error = std::string("Could not prepare output directory: ") + options.outputDir + " (" +
+                ex.what() + ")";
+        return false;
+    } catch (...) {
+        error = "Could not prepare output directory: " + options.outputDir;
+        return false;
+    }
+}
+
+int ExecuteBatchRuns(const Options& options) {
+    std::string prepError;
+    if (!PrepareBatchOutputArea(options, prepError)) {
+        std::cerr << prepError << "\n";
+        return 1;
+    }
+
+    int semanticPassCount = 0;
+    double reorderSum = 0.0;
+    double blockReorderSum = 0.0;
+    std::size_t totalBranchFixups = 0;
+    std::size_t totalSideEffectViolations = 0;
+    int cfgEnabledRuns = 0;
+
+    std::vector<std::uint64_t> transformedHashes;
+    std::vector<std::string> outputPaths;
+    transformedHashes.reserve(options.runs);
+    outputPaths.reserve(options.runs);
+
+    for (int runIndex = 1; runIndex <= options.runs; ++runIndex) {
+        Options runOptions = options;
+        runOptions.runs = 1;
+        runOptions.interactive = false;
+        runOptions.cleanOutputDir = false;
+        runOptions.outputPath = BuildBatchOutputPath(options, runIndex);
+
+        if (options.hasSeed) {
+            runOptions.hasSeed = true;
+            runOptions.seed = options.fixedSeedAcrossRuns
+                                  ? options.seed
+                                  : DeriveSeed(options.seed, static_cast<std::uint64_t>(runIndex));
+        } else {
+            runOptions.hasSeed = false;
+            runOptions.seed = 0;
+        }
+
+        std::cout << "\nRun " << runIndex << "/" << options.runs << "\n";
+        RunSummary summary;
+        int exitCode = ExecuteSingleRun(runOptions, summary);
+        if (exitCode != 0) {
+            return exitCode;
+        }
+
+        reorderSum += summary.reorderRatio;
+        blockReorderSum += summary.blockReorderRatio;
+        totalBranchFixups += summary.branchFixupsInserted;
+        totalSideEffectViolations += summary.sideEffectViolations;
+        if (summary.cfgModeEnabled) {
+            cfgEnabledRuns += 1;
+        }
+        if (options.verify && summary.verifyRequested && summary.verifyPass) {
+            semanticPassCount += 1;
+        }
+
+        transformedHashes.push_back(summary.transformedHash);
+        outputPaths.push_back(summary.outputPath);
+    }
+
+    std::cout << "\nBatch Summary\n";
+    std::cout << "-------------\n";
+
+    if (options.verify) {
+        double passRate = options.runs == 0 ? 0.0
+                                            : (100.0 * static_cast<double>(semanticPassCount) /
+                                               static_cast<double>(options.runs));
+        std::cout << "Semantic pass rate        : " << semanticPassCount << "/" << options.runs
+                  << " (" << std::fixed << std::setprecision(2) << passRate << "%)\n";
+        std::cout << std::defaultfloat;
+    }
+
+    double avgReorder = options.runs == 0 ? 0.0 : reorderSum / static_cast<double>(options.runs);
+    double avgBlockReorder =
+        options.runs == 0 ? 0.0 : blockReorderSum / static_cast<double>(options.runs);
+
+    std::cout << "Average reorder ratio     : " << std::fixed << std::setprecision(2) << avgReorder
+              << "%\n";
+    std::cout << "Average block reorder ratio: " << std::fixed << std::setprecision(2)
+              << avgBlockReorder << "%\n";
+    std::cout << std::defaultfloat;
+    std::cout << "Total branch fixups       : " << totalBranchFixups << "\n";
+    std::cout << "CFG-enabled runs          : " << cfgEnabledRuns << "/" << options.runs << "\n";
+    std::cout << "Total side-effect violations across runs: " << totalSideEffectViolations << "\n";
+
+    if (transformedHashes.size() >= 2) {
+        bool hashChanged = transformedHashes[0] != transformedHashes[1];
+        std::cout << "First two run hashes differ: " << (hashChanged ? "YES" : "NO") << "\n";
+    }
+
+    std::cout << "Batch artifacts:\n";
+    for (const std::string& path : outputPaths) {
+        std::cout << "  " << path << "\n";
+    }
+
+    return 0;
+}
+
 std::string PromptLine(const std::string& prompt, const std::string& defaultValue = "") {
     std::cout << prompt;
     if (!defaultValue.empty()) {
@@ -1561,6 +1801,10 @@ int main(int argc, char** argv) {
 
     if (options.interactive) {
         return RunInteractiveSession(options);
+    }
+
+    if (options.runs > 1) {
+        return ExecuteBatchRuns(options);
     }
 
     RunSummary summary;
