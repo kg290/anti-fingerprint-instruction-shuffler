@@ -29,6 +29,24 @@ function Read-Default([string]$prompt, [string]$defaultValue) {
     return $value.Trim()
 }
 
+function Remove-DirectoryTree([string]$Path) {
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq 6) {
+                throw
+            }
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
+}
+
 function Read-YesNo([string]$prompt, [bool]$defaultYes) {
     $suffix = if ($defaultYes) { "Y/n" } else { "y/N" }
     while ($true) {
@@ -203,8 +221,7 @@ function Get-AutoBestProfile {
     return [PSCustomObject]@{
         Verify = $true
         ShowMap = $false
-        EnableSub = $false
-        EnableExplain = $false
+        EnableExplain = $llmConfigured
         UseSeed = $false
         LlmConfigured = $llmConfigured
     }
@@ -244,7 +261,7 @@ function Invoke-Afis([string[]]$Arguments, [string]$ConsoleSummaryPath = "") {
 function Build-CppDeterministicFallbackArgs([string[]]$Arguments) {
     $filtered = New-Object 'System.Collections.Generic.List[string]'
     foreach ($arg in $Arguments) {
-        if ($arg -in @("--no-llm-cpp", "--llm-substitute", "--llm-explain")) {
+        if ($arg -in @("--no-llm-cpp", "--llm-explain")) {
             continue
         }
         $filtered.Add($arg) | Out-Null
@@ -381,7 +398,10 @@ function Write-ValidationReasoningReport(
     $transformedHash = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Transformed IR hash"
     $movedInstructionSlots = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Moved instruction slots"
     $reorderRatio = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Reorder ratio"
+    $blockReorderRatio = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Block reorder ratio"
+    $branchFixups = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Branch fixups inserted"
     $renamedSymbols = Get-FieldValueFromOutput -OutputLines $OutputLines -FieldName "Renamed symbols"
+    $artifactDir = Split-Path -Parent $TransformedFile
 
     $hashChanged = "UNKNOWN"
     if (-not [string]::IsNullOrWhiteSpace($originalHash) -and -not [string]::IsNullOrWhiteSpace($transformedHash)) {
@@ -427,6 +447,16 @@ function Write-ValidationReasoningReport(
     }
 
     $reasoningLines.Add("") | Out-Null
+    $reasoningLines.Add("Feature Walkthrough") | Out-Null
+    $reasoningLines.Add("1) Parsing / IR conversion: AFIS first normalizes the input into IR so all later compiler passes work on one internal format.") | Out-Null
+    $reasoningLines.Add("2) Optimization: AFIS simplifies the IR before diversification using constant folding, constant propagation, copy propagation, and dead code elimination.") | Out-Null
+    $reasoningLines.Add("3) CFG / dependency analysis: AFIS computes hazards and barriers to decide which instructions are legally movable.") | Out-Null
+    $reasoningLines.Add("4) Safe shuffling: AFIS changes layout only when dependency rules still preserve legal execution order.") | Out-Null
+    $reasoningLines.Add("5) Register renaming: AFIS renames identifiers consistently to further reduce structural fingerprint similarity.") | Out-Null
+    $reasoningLines.Add("6) Fingerprint metrics: AFIS measures how much structural change was achieved.") | Out-Null
+    $reasoningLines.Add("7) Verification: AFIS executes both versions and compares their printed outputs directly.") | Out-Null
+
+    $reasoningLines.Add("") | Out-Null
     $reasoningLines.Add("Verification Output Snapshot") | Out-Null
     $reasoningLines.Add("Original output:") | Out-Null
     if ([string]::IsNullOrWhiteSpace($originalOutput)) {
@@ -455,12 +485,26 @@ function Write-ValidationReasoningReport(
     if (-not [string]::IsNullOrWhiteSpace($instructionCount)) { $reasoningLines.Add("- Instruction count: $instructionCount") | Out-Null }
     if (-not [string]::IsNullOrWhiteSpace($movedInstructionSlots)) { $reasoningLines.Add("- Moved instruction slots: $movedInstructionSlots") | Out-Null }
     if (-not [string]::IsNullOrWhiteSpace($reorderRatio)) { $reasoningLines.Add("- Reorder ratio: $reorderRatio") | Out-Null }
+    if (-not [string]::IsNullOrWhiteSpace($blockReorderRatio)) { $reasoningLines.Add("- Block reorder ratio: $blockReorderRatio") | Out-Null }
+    if (-not [string]::IsNullOrWhiteSpace($branchFixups)) { $reasoningLines.Add("- Branch fixups inserted: $branchFixups") | Out-Null }
     if (-not [string]::IsNullOrWhiteSpace($renamedSymbols)) { $reasoningLines.Add("- Renamed symbols: $renamedSymbols") | Out-Null }
     if (-not [string]::IsNullOrWhiteSpace($originalHash)) { $reasoningLines.Add("- Original IR hash: $originalHash") | Out-Null }
     if (-not [string]::IsNullOrWhiteSpace($transformedHash)) { $reasoningLines.Add("- Transformed IR hash: $transformedHash") | Out-Null }
+    $reasoningLines.Add("- Artifact directory: $artifactDir") | Out-Null
     $reasoningLines.Add("- Console summary: $ConsoleSummaryPath") | Out-Null
     $reasoningLines.Add("- Markdown report: $ReportPath") | Out-Null
     $reasoningLines.Add("- HTML report: $ReportHtmlPath") | Out-Null
+    $reasoningLines.Add("- Workflow diagram: $(Join-Path $artifactDir 'workflow.svg')") | Out-Null
+    $reasoningLines.Add("- CFG graph: $(Join-Path $artifactDir 'cfg.dot')") | Out-Null
+    $reasoningLines.Add("- Dependency graph: $(Join-Path $artifactDir 'dependency.dot')") | Out-Null
+
+    $reasoningLines.Add("") | Out-Null
+    $reasoningLines.Add("Best Demo Order") | Out-Null
+    $reasoningLines.Add("1) Open the HTML report first for the complete step-by-step system run.") | Out-Null
+    $reasoningLines.Add("2) Show workflow.svg for the visual pipeline.") | Out-Null
+    $reasoningLines.Add("3) Open 01_original.ir through 07_final.ir one by one to explain each compiler stage clearly.") | Out-Null
+    $reasoningLines.Add("4) Show cfg.dot and dependency.dot when explaining why instruction movement was legal.") | Out-Null
+    $reasoningLines.Add("5) End with verification.txt to show that the transformed program still behaves the same.") | Out-Null
 
     $reasoningDir = Split-Path -Parent $ReasoningPath
     if (-not [string]::IsNullOrWhiteSpace($reasoningDir)) {
@@ -484,13 +528,11 @@ function Start-ValidationRun {
     $sourceFile = Select-SampleOrManual
     $validationKey = ConvertTo-SafeName $sourceFile
     $validationDir = Join-Path "build/validation" $validationKey
+    Remove-DirectoryTree $validationDir
     New-Item -ItemType Directory -Path $validationDir -Force | Out-Null
 
     $outputPath = Join-Path $validationDir "transformed.ir"
-    $reportPath = Join-Path $validationDir "validation_summary.md"
     $reportHtmlPath = Join-Path $validationDir "validation_summary.html"
-    $summaryPath = Join-Path $validationDir "validation_console_summary.txt"
-    $reasoningPath = Join-Path $validationDir "validation_reasoning.txt"
     $opts = Get-AutoBestProfile
 
     $args = New-Object 'System.Collections.Generic.List[string]'
@@ -505,15 +547,15 @@ function Start-ValidationRun {
     $args.Add("--env") | Out-Null
     $args.Add($EnvPath) | Out-Null
     $args.Add("--verify") | Out-Null
-    $args.Add("--report") | Out-Null
-    $args.Add($reportPath) | Out-Null
     $args.Add("--report-html") | Out-Null
     $args.Add($reportHtmlPath) | Out-Null
+    $args.Add("--artifact-dir") | Out-Null
+    $args.Add($validationDir) | Out-Null
+    $args.Add("--dump-passes") | Out-Null
     if (-not $opts.LlmConfigured) {
         $args.Add("--no-llm-cpp") | Out-Null
     }
     if ($opts.ShowMap) { $args.Add("--show-map") | Out-Null }
-    if ($opts.EnableSub) { $args.Add("--llm-substitute") | Out-Null }
     if ($opts.EnableExplain) { $args.Add("--llm-explain") | Out-Null }
     if ($opts.UseSeed) {
         $args.Add("--seed") | Out-Null
@@ -525,27 +567,20 @@ function Start-ValidationRun {
     Write-Host "Auto profile: verify=ON, llmConfigured=$($opts.LlmConfigured), cppConversion=$(if ($opts.LlmConfigured) { 'LLM with auto fallback' } else { 'deterministic' })" -ForegroundColor DarkCyan
     Write-Host "Command: afis.exe $($args -join ' ')" -ForegroundColor DarkCyan
 
-    $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sourceFile) -LlmConfigured $opts.LlmConfigured -ConsoleSummaryPath $summaryPath
+    $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sourceFile) -LlmConfigured $opts.LlmConfigured
     $result = $autoInvoke.Result
     if ($result.ExitCode -ne 0) {
         throw "Validation run failed with exit code $($result.ExitCode)."
     }
-
-    $reasoning = Write-ValidationReasoningReport `
-        -ReasoningPath $reasoningPath `
-        -SourceFile $sourceFile `
-        -TransformedFile $outputPath `
-        -ConsoleSummaryPath $summaryPath `
-        -ReportPath $reportPath `
-        -ReportHtmlPath $reportHtmlPath `
-        -OutputLines $result.Output
+    $reasoning = Get-VerificationDetails -OutputLines $result.Output
 
     Write-Host ""
     Write-Host "Validation Evidence" -ForegroundColor Cyan
-    Write-Host "- Console summary : $summaryPath"
-    Write-Host "- Markdown report : $reportPath"
     Write-Host "- HTML report     : $reportHtmlPath"
-    Write-Host "- Reasoning report: $reasoningPath"
+    Write-Host "- CFG diagram     : $(Join-Path $validationDir 'cfg.svg')"
+    Write-Host "- Dependency graph: $(Join-Path $validationDir 'dependency.svg')"
+    Write-Host "- Workflow diagram: $(Join-Path $validationDir 'workflow.svg')"
+    Write-Host "- Verification txt: $(Join-Path $validationDir 'verification.txt')"
     Write-Host "- C++ fallback used: $($autoInvoke.UsedCppFallback)"
 
     if ($reasoning.SemanticEquivalence -eq "PASS") {
@@ -564,7 +599,6 @@ function Get-FeatureOptions([bool]$includeRunsPrompt) {
     $showMap = Read-YesNo "Show rename map" $false
     $forceCpp = Read-YesNo "Force C++ input mode (--input-cpp)" $false
     $allowLlmCpp = Read-YesNo "Allow LLM for C++ conversion" $false
-    $enableSub = Read-YesNo "Enable LLM substitution" $false
     $enableExplain = Read-YesNo "Enable LLM explanation" $false
 
     $runs = 1
@@ -594,7 +628,6 @@ function Get-FeatureOptions([bool]$includeRunsPrompt) {
         ShowMap = $showMap
         ForceCpp = $forceCpp
         AllowLlmCpp = $allowLlmCpp
-        EnableSub = $enableSub
         EnableExplain = $enableExplain
         Runs = $runs
         UseSeed = $useSeed
@@ -611,13 +644,11 @@ function Start-FullRun {
     $sourceFile = Select-SampleOrManual
     $runKey = ConvertTo-SafeName $sourceFile
     $runDir = Join-Path "build/full_run" $runKey
+    Remove-DirectoryTree $runDir
     New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 
     $outputPath = Join-Path $runDir "transformed.ir"
-    $reportPath = Join-Path $runDir "summary.md"
     $reportHtmlPath = Join-Path $runDir "summary.html"
-    $summaryPath = Join-Path $runDir "console_summary.txt"
-    $reasoningPath = Join-Path $runDir "validation_reasoning.txt"
     $opts = Get-AutoBestProfile
 
     $args = New-Object 'System.Collections.Generic.List[string]'
@@ -637,12 +668,12 @@ function Start-FullRun {
     if ($opts.Verify) { $args.Add("--verify") | Out-Null }
     if ($opts.ShowMap) { $args.Add("--show-map") | Out-Null }
     if (-not $opts.LlmConfigured) { $args.Add("--no-llm-cpp") | Out-Null }
-    if ($opts.EnableSub) { $args.Add("--llm-substitute") | Out-Null }
     if ($opts.EnableExplain) { $args.Add("--llm-explain") | Out-Null }
-    $args.Add("--report") | Out-Null
-    $args.Add($reportPath) | Out-Null
     $args.Add("--report-html") | Out-Null
     $args.Add($reportHtmlPath) | Out-Null
+    $args.Add("--artifact-dir") | Out-Null
+    $args.Add($runDir) | Out-Null
+    $args.Add("--dump-passes") | Out-Null
     if ($opts.UseSeed) {
         $args.Add("--seed") | Out-Null
         $args.Add("123456") | Out-Null
@@ -651,25 +682,20 @@ function Start-FullRun {
     Write-Host ""
     Write-Host "Auto profile: verify=ON, llmConfigured=$($opts.LlmConfigured), cppAutoDetect=ON" -ForegroundColor DarkCyan
     Write-Host "Running: afis.exe $($args -join ' ')" -ForegroundColor Cyan
-    $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sourceFile) -LlmConfigured $opts.LlmConfigured -ConsoleSummaryPath $summaryPath
+    $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sourceFile) -LlmConfigured $opts.LlmConfigured
     $result = $autoInvoke.Result
     if ($result.ExitCode -ne 0) {
         throw "Run failed with exit code $($result.ExitCode)."
     }
-
-    $reasoning = Write-ValidationReasoningReport `
-        -ReasoningPath $reasoningPath `
-        -SourceFile $sourceFile `
-        -TransformedFile $outputPath `
-        -ConsoleSummaryPath $summaryPath `
-        -ReportPath $reportPath `
-        -ReportHtmlPath $reportHtmlPath `
-        -OutputLines $result.Output
+    $reasoning = Get-VerificationDetails -OutputLines $result.Output
 
     Write-Host ""
     Write-Host "Run completed." -ForegroundColor Green
-    Write-Host "Console summary: $summaryPath"
-    Write-Host "Reasoning report: $reasoningPath"
+    Write-Host "HTML report: $reportHtmlPath"
+    Write-Host "CFG diagram: $(Join-Path $runDir 'cfg.svg')"
+    Write-Host "Dependency graph: $(Join-Path $runDir 'dependency.svg')"
+    Write-Host "Workflow diagram: $(Join-Path $runDir 'workflow.svg')"
+    Write-Host "Verification txt: $(Join-Path $runDir 'verification.txt')"
     Write-Host "C++ fallback used: $($autoInvoke.UsedCppFallback)"
     Write-Host "Semantic equivalence: $($reasoning.SemanticEquivalence)"
 }
@@ -683,9 +709,6 @@ function Start-RunAllSamples {
     }
 
     $rootDir = "build/all_samples"
-    if (Test-Path $rootDir) {
-        Remove-Item -Path $rootDir -Recurse -Force
-    }
     New-Item -ItemType Directory -Path $rootDir -Force | Out-Null
 
     $opts = Get-AutoBestProfile
@@ -693,7 +716,7 @@ function Start-RunAllSamples {
 
     Write-Host ""
     Write-Host "Running all samples..." -ForegroundColor Cyan
-    Write-Host "Auto profile: verify=ON, llmConfigured=$($opts.LlmConfigured), llmSubstitute=$($opts.EnableSub), llmExplain=$($opts.EnableExplain), cppAutoDetect=ON, cppFallback=ON, runsPerSample=$runsPerSample" -ForegroundColor DarkCyan
+    Write-Host "Auto profile: verify=ON, llmConfigured=$($opts.LlmConfigured), llmExplain=$($opts.EnableExplain), cppAutoDetect=ON, cppFallback=ON, runsPerSample=$runsPerSample" -ForegroundColor DarkCyan
 
     $results = New-Object 'System.Collections.Generic.List[object]'
 
@@ -711,10 +734,7 @@ function Start-RunAllSamples {
             }
 
             $outputPath = Join-Path $runDir "transformed.ir"
-            $reportPath = Join-Path $runDir "summary.md"
             $reportHtmlPath = Join-Path $runDir "summary.html"
-            $consoleSummaryPath = Join-Path $runDir "console_summary.txt"
-            $reasoningPath = Join-Path $runDir "validation_reasoning.txt"
 
             $args = New-Object 'System.Collections.Generic.List[string]'
             if (Is-CppInputFile $sampleFile) {
@@ -728,15 +748,15 @@ function Start-RunAllSamples {
             $args.Add($outputPath) | Out-Null
             $args.Add("--env") | Out-Null
             $args.Add($EnvPath) | Out-Null
-            $args.Add("--report") | Out-Null
-            $args.Add($reportPath) | Out-Null
             $args.Add("--report-html") | Out-Null
             $args.Add($reportHtmlPath) | Out-Null
+            $args.Add("--artifact-dir") | Out-Null
+            $args.Add($runDir) | Out-Null
+            $args.Add("--dump-passes") | Out-Null
 
             if ($opts.Verify) { $args.Add("--verify") | Out-Null }
             if ($opts.ShowMap) { $args.Add("--show-map") | Out-Null }
             if (-not $opts.LlmConfigured) { $args.Add("--no-llm-cpp") | Out-Null }
-            if ($opts.EnableSub) { $args.Add("--llm-substitute") | Out-Null }
             if ($opts.EnableExplain) { $args.Add("--llm-explain") | Out-Null }
             if ($opts.UseSeed) {
                 $args.Add("--seed") | Out-Null
@@ -745,17 +765,9 @@ function Start-RunAllSamples {
 
             Write-Host ""
             Write-Host "Sample: $sampleFile (run $runIndex/$runsPerSample)" -ForegroundColor Yellow
-            $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sampleFile) -LlmConfigured $opts.LlmConfigured -ConsoleSummaryPath $consoleSummaryPath
+            $autoInvoke = Invoke-AfisAuto -Arguments $args.ToArray() -IsCppInput (Is-CppInputFile $sampleFile) -LlmConfigured $opts.LlmConfigured
             $runResult = $autoInvoke.Result
-
-            $reasoning = Write-ValidationReasoningReport `
-                -ReasoningPath $reasoningPath `
-                -SourceFile $sampleFile `
-                -TransformedFile $outputPath `
-                -ConsoleSummaryPath $consoleSummaryPath `
-                -ReportPath $reportPath `
-                -ReportHtmlPath $reportHtmlPath `
-                -OutputLines $runResult.Output
+            $reasoning = Get-VerificationDetails -OutputLines $runResult.Output
 
             $status = if ($runResult.ExitCode -eq 0 -and $reasoning.SemanticEquivalence -eq "PASS") { "PASS" } else { "FAIL" }
             $results.Add([PSCustomObject]@{
@@ -764,7 +776,7 @@ function Start-RunAllSamples {
                 Status = $status
                 Semantic = $reasoning.SemanticEquivalence
                 Folder = $runDir
-                Reasoning = $reasoningPath
+                Report = $reportHtmlPath
                 UsedCppFallback = $autoInvoke.UsedCppFallback
                 ExitCode = $runResult.ExitCode
             }) | Out-Null
@@ -779,24 +791,28 @@ function Start-RunAllSamples {
     foreach ($item in $results) {
         Write-Host ("[{0}] {1} run {2} (semantic={3})" -f $item.Status, $item.Sample, $item.Run, $item.Semantic)
         Write-Host ("  Folder: {0}" -f $item.Folder)
-        Write-Host ("  Reasoning: {0}" -f $item.Reasoning)
+        Write-Host ("  HTML report: {0}" -f $item.Report)
         Write-Host ("  C++ fallback used: {0}" -f $item.UsedCppFallback)
     }
 
-    $combinedSummary = Join-Path $rootDir "_run_all_summary.txt"
-    $results | Format-Table -AutoSize | Out-String | Out-File -FilePath $combinedSummary -Encoding utf8
-
     Write-Host ""
     Write-Host "Per-sample folder artifacts:" -ForegroundColor Green
+    Write-Host "  01_original.ir"
+    Write-Host "  02_constant_fold.ir"
+    Write-Host "  03_constant_propagation.ir"
+    Write-Host "  04_copy_propagation.ir"
+    Write-Host "  05_dead_code_elimination.ir"
+    Write-Host "  06_shuffled.ir"
+    Write-Host "  07_final.ir"
+    Write-Host "  cfg.svg"
+    Write-Host "  dependency.svg"
+    Write-Host "  workflow.svg"
+    Write-Host "  verification.txt"
     Write-Host "  transformed.ir"
-    Write-Host "  summary.md"
     Write-Host "  summary.html"
-    Write-Host "  console_summary.txt"
-    Write-Host "  validation_reasoning.txt"
     if ($runsPerSample -gt 1) {
         Write-Host "  runs/run_XXX/ (one folder per run)"
     }
-    Write-Host "Combined summary: $combinedSummary"
 }
 
 while ($true) {

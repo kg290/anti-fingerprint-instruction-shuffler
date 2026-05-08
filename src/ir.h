@@ -67,6 +67,7 @@ bool IsInteger(const std::string& token);
 std::string Trim(const std::string& text);
 std::vector<std::string> SplitWhitespace(const std::string& text);
 std::string InstructionToString(const Instruction& inst);
+std::string ProgramToText(const Program& program);
 
 }  // namespace afis
 

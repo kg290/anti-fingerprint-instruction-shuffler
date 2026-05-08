@@ -173,6 +173,7 @@ Invoke-AfisCase -ResultList $results -Name "ir_cfg_verify" -CommandArgs @("--inp
 Invoke-AfisCase -ResultList $results -Name "ir_side_effects_verify" -CommandArgs @("--input","samples/example_side_effects.ir","--output","build/comprehensive_test/ir_side_effects_verify.ir","--verify","--env",".env")
 Invoke-AfisCase -ResultList $results -Name "cpp_basic_verify_deterministic" -CommandArgs @("--input-cpp","samples/example_cpp_basic.cpp","--output","build/comprehensive_test/cpp_basic_verify.ir","--verify","--env",".env","--no-llm-cpp")
 Invoke-AfisCase -ResultList $results -Name "cpp_calls_verify_deterministic" -CommandArgs @("--input-cpp","samples/example_cpp_calls.cpp","--output","build/comprehensive_test/cpp_calls_verify.ir","--verify","--env",".env","--no-llm-cpp")
+Invoke-AfisCase -ResultList $results -Name "variant_best_selection" -CommandArgs @("--input","samples/example_full.ir","--output","build/comprehensive_test/variant_best.ir","--verify","--variants","3","--select-best-variant","--artifact-dir","build/comprehensive_test/variants","--env",".env")
 Invoke-AfisCase -ResultList $results -Name "batch_unseeded_runs2_verify" -CommandArgs @("--input","samples/example_full.ir","--output","build/comprehensive_test/batch_unseeded_out.ir","--runs","2","--output-dir","build/comprehensive_test/batch_unseeded","--clean-output-dir","--verify","--env",".env")
 Invoke-AfisCase -ResultList $results -Name "batch_fixed_seed_runs2_verify" -CommandArgs @("--input","samples/example_full.ir","--output","build/comprehensive_test/batch_fixed_out.ir","--runs","2","--output-dir","build/comprehensive_test/batch_fixed","--clean-output-dir","--verify","--seed","123456","--fixed-seed-runs","--env",".env")
 
@@ -227,9 +228,9 @@ if ($runAll.Success) {
     }
 
     if ($passed -eq $sampleFiles.Count -and $total -eq $sampleFiles.Count) {
-        Add-Result $results "artifacts" "run_all_count_match" "PASS" "all samples reported pass" "build/all_samples/_run_all_summary.txt"
+        Add-Result $results "artifacts" "run_all_count_match" "PASS" "all samples reported pass" "build/all_samples"
     } else {
-        Add-Result $results "artifacts" "run_all_count_match" "FAIL" ("expected {0}/{0}, got {1}/{2}" -f $sampleFiles.Count, $passed, $total) "build/all_samples/_run_all_summary.txt"
+        Add-Result $results "artifacts" "run_all_count_match" "FAIL" ("expected {0}/{0}, got {1}/{2}" -f $sampleFiles.Count, $passed, $total) "build/all_samples"
     }
 
     foreach ($sampleFile in $sampleFiles) {
@@ -237,11 +238,19 @@ if ($runAll.Success) {
         $sampleDir = Join-Path $projectRoot ("build/all_samples/{0}" -f $sampleKey)
 
         $requiredFiles = @(
+            "01_original.ir",
+            "02_constant_fold.ir",
+            "03_constant_propagation.ir",
+            "04_copy_propagation.ir",
+            "05_dead_code_elimination.ir",
+            "06_shuffled.ir",
+            "07_final.ir",
+            "cfg.svg",
+            "dependency.svg",
+            "workflow.svg",
+            "verification.txt",
             "transformed.ir",
-            "summary.md",
-            "summary.html",
-            "console_summary.txt",
-            "validation_reasoning.txt"
+            "summary.html"
         )
 
         $missing = New-Object 'System.Collections.Generic.List[string]'
@@ -256,15 +265,51 @@ if ($runAll.Success) {
             Add-Result $results "artifacts" ("artifact_set_{0}" -f $sampleKey) "FAIL" ("missing files: {0}" -f ($missing -join ', ')) $sampleDir
             continue
         }
+    }
+}
 
-        $reasoningPath = Join-Path $sampleDir "validation_reasoning.txt"
-        $reasoningText = Get-Content -Path $reasoningPath -Raw
-        if ($reasoningText -match 'Semantic equivalence:\s*PASS') {
-            Add-Result $results "artifacts" ("reasoning_pass_{0}" -f $sampleKey) "PASS" "reasoning confirms semantic PASS" $reasoningPath
+$variantRoot = Join-Path $projectRoot "build/comprehensive_test/variants"
+$variantSummaryPath = Join-Path $variantRoot "variant_summary.md"
+if (Test-Path $variantSummaryPath) {
+    $variantSummaryText = Get-Content -Path $variantSummaryPath -Raw
+    if ($variantSummaryText -match 'Selected best variant:\s*1|Selected best variant:\s*2|Selected best variant:\s*3') {
+        Add-Result $results "variants" "variant_summary_exists" "PASS" "variant summary generated" $variantSummaryPath
+    } else {
+        Add-Result $results "variants" "variant_summary_exists" "FAIL" "variant summary missing selected best variant line" $variantSummaryPath
+    }
+
+    for ($i = 1; $i -le 3; $i++) {
+        $variantDir = Join-Path $variantRoot ("variant_{0}" -f $i)
+        $requiredVariantFiles = @(
+            "01_original.ir",
+            "02_constant_fold.ir",
+            "03_constant_propagation.ir",
+            "04_copy_propagation.ir",
+            "05_dead_code_elimination.ir",
+            "06_shuffled.ir",
+            "07_final.ir",
+            "cfg.svg",
+            "dependency.svg",
+            "workflow.svg",
+            "verification.txt"
+        )
+
+        $missingVariantFiles = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($file in $requiredVariantFiles) {
+            $path = Join-Path $variantDir $file
+            if (-not (Test-Path $path)) {
+                $missingVariantFiles.Add($file) | Out-Null
+            }
+        }
+
+        if ($missingVariantFiles.Count -eq 0) {
+            Add-Result $results "variants" ("variant_artifacts_{0}" -f $i) "PASS" "full artifact set present" $variantDir
         } else {
-            Add-Result $results "artifacts" ("reasoning_pass_{0}" -f $sampleKey) "FAIL" "reasoning missing semantic PASS" $reasoningPath
+            Add-Result $results "variants" ("variant_artifacts_{0}" -f $i) "FAIL" ("missing files: {0}" -f ($missingVariantFiles -join ', ')) $variantDir
         }
     }
+} else {
+    Add-Result $results "variants" "variant_summary_exists" "FAIL" "variant summary not generated" $variantRoot
 }
 
 $summaryPath = Join-Path $testRoot "summary.txt"

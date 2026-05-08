@@ -1,8 +1,8 @@
 # Example 1: mostly pure arithmetic, high shuffling freedom
 # Expected printed value: 63
 
-a = 5
-b = 7
+call seed_a 5 -> a
+call seed_b 7 -> b
 t1 = a + b
 t2 = a * b
 t3 = t1 + t2

@@ -104,4 +104,15 @@ std::string InstructionToString(const Instruction& inst) {
     return "nop";
 }
 
+std::string ProgramToText(const Program& program) {
+    std::ostringstream out;
+    for (std::size_t i = 0; i < program.instructions.size(); ++i) {
+        out << InstructionToString(program.instructions[i]);
+        if (i + 1 < program.instructions.size()) {
+            out << "\n";
+        }
+    }
+    return out.str();
+}
+
 }  // namespace afis

@@ -1,0 +1,12 @@
+# Example 8: calls + memory + copy opportunities
+# Expected printed value: 13
+
+a = 6
+b = 3
+call max a b -> m
+copy1 = m
+store slot1, copy1
+load back, slot1
+call inc back -> incd
+out = incd + a
+print out

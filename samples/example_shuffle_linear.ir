@@ -1,0 +1,16 @@
+# Example: straight-line code with high shuffling freedom
+# Best use: demonstrate safe instruction movement in a linear region
+# Expected printed value: 58
+
+call seed_a 2 -> a
+call seed_b 5 -> b
+call seed_c 8 -> c
+call seed_d 11 -> d
+t1 = a + b
+t2 = c + d
+t3 = a * c
+t4 = b + d
+result = t1 + t2
+result = result + t3
+result = result + t4
+print result

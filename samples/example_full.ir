@@ -1,5 +1,5 @@
 # Example 3: arithmetic + call + memory + output
-# Expected printed value: 24
+# Expected printed value: 26
 
 a = 3
 b = 8

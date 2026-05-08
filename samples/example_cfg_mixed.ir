@@ -1,0 +1,18 @@
+# Example 7: mixed CFG + arithmetic + side effects
+# Expected printed value: 12
+
+x = 1
+y = 2
+sum = 0
+
+L_loop:
+if x > 3 goto L_end
+t1 = x + y
+sum = sum + t1
+store slot0, sum
+load last, slot0
+x = x + 1
+goto L_loop
+
+L_end:
+print last

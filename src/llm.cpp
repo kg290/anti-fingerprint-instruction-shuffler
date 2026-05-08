@@ -389,6 +389,7 @@ LlmResult GeminiClient::GenerateText(const std::string& systemPrompt,
 
     std::filesystem::path reqPath = tempDir / ("afis_gemini_req_" + tag + ".json");
     std::filesystem::path respPath = tempDir / ("afis_gemini_resp_" + tag + ".json");
+    std::filesystem::path errPath = tempDir / ("afis_gemini_err_" + tag + ".txt");
 
     {
         std::ofstream req(reqPath);
@@ -412,6 +413,7 @@ LlmResult GeminiClient::GenerateText(const std::string& systemPrompt,
     std::string curlPath = QuoteForCommand(config_.curlPath.empty() ? "curl" : config_.curlPath);
     std::string reqPathQuoted = "\"@" + reqPath.string() + "\"";
     std::string respPathQuoted = "\"" + respPath.string() + "\"";
+    std::string errPathQuoted = "\"" + errPath.string() + "\"";
 
     std::ostringstream cmd;
     cmd << curlPath
@@ -419,15 +421,21 @@ LlmResult GeminiClient::GenerateText(const std::string& systemPrompt,
         << " -X POST \"" << endpoint << "\""
         << " -H \"Content-Type: application/json\""
         << " --data-binary " << reqPathQuoted
-        << " -o " << respPathQuoted;
+        << " -o " << respPathQuoted
+        << " 2> " << errPathQuoted;
 
     int code = std::system(cmd.str().c_str());
     if (code != 0) {
+        std::string curlError = Trim(ReadWholeFile(errPath));
         std::filesystem::remove(reqPath);
         std::filesystem::remove(respPath);
+        std::filesystem::remove(errPath);
 
         std::ostringstream err;
         err << "Gemini API request failed (curl exit code " << code << ").";
+        if (!curlError.empty()) {
+            err << " curl: " << curlError;
+        }
         result.error = err.str();
         return result;
     }
@@ -437,6 +445,7 @@ LlmResult GeminiClient::GenerateText(const std::string& systemPrompt,
 
     std::filesystem::remove(reqPath);
     std::filesystem::remove(respPath);
+    std::filesystem::remove(errPath);
 
     if (response.empty()) {
         result.error = "Gemini API returned an empty response.";

@@ -35,6 +35,7 @@ $runDir = Join-Path $projectRoot "build/demo_runs"
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 if ($CleanRunDir) {
     Get-ChildItem -Path $runDir -Filter "run_*.ir" -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -Path $runDir -Directory -Filter "run_*_artifacts" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 }
 
 Write-Host "Step 2/5: Running transformed builds"
@@ -48,12 +49,18 @@ $sideEffectViolationTotal = 0
 
 for ($i = 1; $i -le $Runs; $i++) {
     $outFile = Join-Path $runDir ("run_" + $i + ".ir")
+    $artifactDir = Join-Path $runDir ("run_" + $i + "_artifacts")
     $runParams = New-Object 'System.Collections.Generic.List[string]'
     $runParams.Add("--input") | Out-Null
     $runParams.Add($inputPath) | Out-Null
     $runParams.Add("--output") | Out-Null
     $runParams.Add($outFile) | Out-Null
     $runParams.Add("--verify") | Out-Null
+    $runParams.Add("--artifact-dir") | Out-Null
+    $runParams.Add($artifactDir) | Out-Null
+    $runParams.Add("--dump-passes") | Out-Null
+    $runParams.Add("--report-html") | Out-Null
+    $runParams.Add((Join-Path $artifactDir "summary.html")) | Out-Null
 
     if ($FixedSeed) {
         $runParams.Add("--seed") | Out-Null
@@ -166,5 +173,18 @@ Write-Host ""
 Write-Host "Step 5/5: Demo artifacts"
 Write-Host "Input IR        : $inputPath"
 Write-Host "Output directory: $runDir"
+Write-Host "Per-run artifacts:"
+Write-Host "  run_N_artifacts/01_original.ir"
+Write-Host "  run_N_artifacts/02_constant_fold.ir"
+Write-Host "  run_N_artifacts/03_constant_propagation.ir"
+Write-Host "  run_N_artifacts/04_copy_propagation.ir"
+Write-Host "  run_N_artifacts/05_dead_code_elimination.ir"
+Write-Host "  run_N_artifacts/06_shuffled.ir"
+Write-Host "  run_N_artifacts/07_final.ir"
+Write-Host "  run_N_artifacts/cfg.svg"
+Write-Host "  run_N_artifacts/dependency.svg"
+Write-Host "  run_N_artifacts/workflow.svg"
+Write-Host "  run_N_artifacts/verification.txt"
+Write-Host "  run_N_artifacts/summary.html"
 Write-Host ""
-Write-Host "Open run_1.ir and run_2.ir side-by-side to show instruction and register-level diversity."
+Write-Host "Open summary.html first, then show workflow.svg, cfg.svg, dependency.svg, verification.txt, and the pass files one by one."

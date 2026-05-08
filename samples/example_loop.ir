@@ -1,0 +1,16 @@
+# Example: loop-specific CFG sample
+# Best use: demonstrate loop control flow and block reordering safety
+# Expected printed value: 20
+
+i = 0
+sum = 0
+
+L_loop:
+if i > 4 goto L_end
+t = i * 2
+sum = sum + t
+i = i + 1
+goto L_loop
+
+L_end:
+print sum

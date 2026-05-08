@@ -73,15 +73,16 @@ If CFG mode is active:
 2. AFIS can reorder non-entry blocks.
 3. AFIS adds fixup jumps if needed to keep flow correct.
 
-### 2.5 Optional LLM substitution
+### 2.5 Optional reports and diagrams
 
-If `--llm-substitute` is enabled:
+If artifact/report options are enabled, AFIS can save:
 
-1. AFIS finds safe substitution candidates.
-2. LLM may suggest candidate IDs.
-3. AFIS still validates them deterministically before applying.
-
-So LLM is advisory; final safety is still deterministic.
+1. pass-by-pass IR files,
+2. CFG and dependency diagrams,
+3. workflow diagram,
+4. transformation trace,
+5. fingerprint metrics,
+6. verification text.
 
 ### 2.6 Register renaming
 
@@ -197,7 +198,7 @@ When you choose Validation proof run:
 2. You pick by number.
 3. Script auto-runs validation with `--verify` so original and transformed outputs are compared.
 4. For C++ input, script tries LLM path and auto-falls back to deterministic conversion if needed.
-5. Script writes validation artifacts (console + markdown + html + reasoning evidence).
+5. Script writes validation artifacts, pass dumps, diagrams, verification text, and an HTML report.
 6. At the end, script prints semantic status and short reason:
 
 - `PASS` means both outputs match.
@@ -210,17 +211,12 @@ Default artifact folder:
 Inside that folder you get:
 
 1. `transformed.ir`
-2. `validation_console_summary.txt`
-3. `validation_summary.md`
-4. `validation_summary.html`
-5. `validation_reasoning.txt`
-
-`validation_reasoning.txt` explains:
-
-- how `--verify` validated behavior,
-- original output vs transformed output snapshot,
-- why PASS/FAIL happened,
-- run facts like hashes and movement metrics.
+2. `validation_summary.html`
+3. `01_original.ir` through `07_final.ir`
+4. `cfg.svg`
+5. `dependency.svg`
+6. `workflow.svg`
+7. `verification.txt`
 
 This mode is the easiest way to prove behavior is preserved with concrete evidence files.
 
@@ -237,15 +233,17 @@ When you choose Run ALL samples:
 
 3. Script asks for number of runs per sample.
 4. It runs AFIS that many times for each sample.
-4. It auto-detects `.cpp` vs `.ir` per file.
-5. For C++ files, it uses LLM path when available and auto-falls back to deterministic conversion if needed.
-6. It saves per-sample artifacts:
+5. It auto-detects `.cpp` vs `.ir` per file.
+6. For C++ files, it uses LLM path when available and auto-falls back to deterministic conversion if needed.
+7. It saves per-sample artifacts:
 
 - `transformed.ir`
-- `summary.md`
 - `summary.html`
-- `console_summary.txt`
-- `validation_reasoning.txt`
+- `01_original.ir` through `07_final.ir`
+- `cfg.svg`
+- `dependency.svg`
+- `workflow.svg`
+- `verification.txt`
 
 If runs-per-sample is greater than 1, each sample folder contains:
 
@@ -255,7 +253,7 @@ If runs-per-sample is greater than 1, each sample folder contains:
 
 Each run folder contains the same artifact set.
 
-7. At end, script prints PASS/FAIL summary for all samples with semantic status and reasoning file path.
+8. At end, script prints PASS/FAIL summary for all samples with semantic status and artifact folders.
 
 This is your one-click project-wide run mode.
 

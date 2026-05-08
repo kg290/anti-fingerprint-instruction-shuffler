@@ -1,0 +1,12 @@
+# Example 6: optimization-friendly IR with constants, copies, and dead code
+# Expected printed value: 35
+
+a = 10
+b = 20
+t1 = 2 + 3
+t2 = a
+t3 = t2 + b
+dead1 = t3 + 99
+dead2 = dead1
+t4 = t1 + t3
+print t4

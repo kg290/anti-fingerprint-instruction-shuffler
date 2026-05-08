@@ -11,17 +11,20 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "cfg.h"
 #include "cpp_frontend.h"
 #include "dependency.h"
+#include "diagram.h"
+#include "fingerprint.h"
 #include "interpreter.h"
 #include "llm.h"
+#include "optimizer.h"
 #include "parser.h"
 #include "renamer.h"
 #include "shuffler.h"
-#include "substitution.h"
 
 namespace afis {
 namespace {
@@ -38,7 +41,6 @@ struct Options {
 
     bool interactive = false;
 
-    bool enableLlmSubstitution = false;
     bool enableLlmExplanation = false;
 
     std::string reportPath;
@@ -50,6 +52,14 @@ struct Options {
     bool forceCppInput = false;
     int runs = 1;
     bool preferLlmCpp = true;
+    std::string artifactDir;
+    bool dumpPasses = false;
+    bool emitCfgDot = false;
+    bool emitDependencyDot = false;
+    bool emitTrace = false;
+    bool emitFingerprintReport = false;
+    int variants = 1;
+    bool selectBestVariant = false;
 };
 
 struct HazardBreakdown {
@@ -70,6 +80,16 @@ struct RunSummary {
 
     std::size_t instructionCount = 0;
     std::size_t blockCount = 0;
+    std::size_t transformedInstructionCount = 0;
+    std::size_t transformedBlockCount = 0;
+    std::size_t originalSymbolCount = 0;
+    std::size_t transformedSymbolCount = 0;
+    std::size_t originalLabelCount = 0;
+    std::size_t transformedLabelCount = 0;
+    std::size_t originalBranchCount = 0;
+    std::size_t transformedBranchCount = 0;
+    std::size_t originalSideEffectCount = 0;
+    std::size_t transformedSideEffectCount = 0;
 
     std::uint64_t masterSeed = 0;
 
@@ -86,6 +106,7 @@ struct RunSummary {
     std::size_t renamedSymbols = 0;
     std::uint64_t originalHash = 0;
     std::uint64_t transformedHash = 0;
+    FingerprintMetrics fingerprintMetrics;
 
     bool verifyRequested = false;
     bool verifyPass = false;
@@ -94,13 +115,10 @@ struct RunSummary {
     std::vector<long long> transformedOutput;
 
     bool llmConfigured = false;
-    bool llmSubstitutionEnabled = false;
     bool llmExplanationEnabled = false;
 
-    SubstitutionStats substitutionStats;
-    std::string substitutionNote;
-
     HazardBreakdown hazards;
+    OptimizationTrace optimizationTrace;
 
     std::string explanation;
     bool explanationFromLlm = false;
@@ -109,11 +127,34 @@ struct RunSummary {
     RenameMap renameMap;
 
     std::string originalText;
+    std::string optimizedText;
+    std::string shuffledText;
     std::string transformedText;
+    std::string artifactDir;
+    std::string originalDumpPath;
+    std::string constantFoldDumpPath;
+    std::string constantPropDumpPath;
+    std::string copyPropDumpPath;
+    std::string dceDumpPath;
+    std::string optimizedDumpPath;
+    std::string shuffledDumpPath;
+    std::string finalDumpPath;
+    std::string cfgDotPath;
+    std::string cfgSvgPath;
+    std::string dependencyDotPath;
+    std::string dependencySvgPath;
+    std::string tracePath;
+    std::string fingerprintReportPath;
+    std::string verificationPath;
+    std::string workflowDotPath;
+    std::string workflowSvgPath;
 
     std::string reportPath;
     std::string reportHtmlPath;
 };
+
+std::string FormatPercent(double value);
+std::string FormatHex64(std::uint64_t value);
 
 std::string ToLower(std::string value) {
     for (char& ch : value) {
@@ -153,10 +194,17 @@ void PrintUsage(const char* exe) {
     std::cerr << "  --verify                Execute original and transformed IR and compare output\n";
     std::cerr << "  --show-map              Print rename map\n";
     std::cerr << "  --interactive           Start loop-based interactive mode\n";
+    std::cerr << "  --artifact-dir <dir>    Directory for pass dumps, diagrams, traces, and metrics\n";
+    std::cerr << "  --dump-passes           Save IR after each major compiler stage\n";
+    std::cerr << "  --emit-cfg-dot          Export CFG diagram as .dot\n";
+    std::cerr << "  --emit-dep-dot          Export dependency graph as .dot\n";
+    std::cerr << "  --emit-trace            Save transformation trace markdown\n";
+    std::cerr << "  --fingerprint-report    Save fingerprint metrics markdown\n";
+    std::cerr << "  --variants <n>          Generate n transformed variants for one input\n";
+    std::cerr << "  --select-best-variant   Rank generated variants and pick the best one\n";
 
     std::cerr << "LLM options (.env Gemini):\n";
     std::cerr << "  --env <file>            Path to .env file (default: .env)\n";
-    std::cerr << "  --llm-substitute        Enable LLM-assisted candidate selection for substitution\n";
     std::cerr << "  --llm-explain           Enable explanation mode and auto markdown report\n";
     std::cerr << "  --report <file.md>      Write markdown report\n";
     std::cerr << "  --report-html <file>    Write html report\n";
@@ -172,7 +220,7 @@ void PrintUsage(const char* exe) {
     std::cerr << "  " << exe
               << " --input samples/example_cpp_basic.cpp --output build/from_cpp.ir --verify --llm-explain\n";
     std::cerr << "  " << exe
-              << " --input samples/example_full.ir --output build/sub.ir --llm-substitute --verify\n";
+              << " --input samples/example_cfg.ir --output build/final.ir --verify --dump-passes --emit-cfg-dot --emit-dep-dot --emit-trace --fingerprint-report --artifact-dir build/demo_case\n";
     std::cerr << "  " << exe << " --interactive\n";
 }
 
@@ -251,6 +299,15 @@ bool ParseArgs(int argc,
             continue;
         }
 
+        if (arg == "--artifact-dir") {
+            if (i + 1 >= argc) {
+                error = "Missing value for --artifact-dir";
+                return false;
+            }
+            options.artifactDir = argv[++i];
+            continue;
+        }
+
         if (arg == "--seed") {
             if (i + 1 >= argc) {
                 error = "Missing value for --seed";
@@ -305,17 +362,37 @@ bool ParseArgs(int argc,
             continue;
         }
 
+        if (arg == "--dump-passes") {
+            options.dumpPasses = true;
+            continue;
+        }
+
+        if (arg == "--emit-cfg-dot") {
+            options.emitCfgDot = true;
+            continue;
+        }
+
+        if (arg == "--emit-dep-dot") {
+            options.emitDependencyDot = true;
+            continue;
+        }
+
+        if (arg == "--emit-trace") {
+            options.emitTrace = true;
+            continue;
+        }
+
+        if (arg == "--fingerprint-report") {
+            options.emitFingerprintReport = true;
+            continue;
+        }
+
         if (arg == "--env") {
             if (i + 1 >= argc) {
                 error = "Missing value for --env";
                 return false;
             }
             options.envPath = argv[++i];
-            continue;
-        }
-
-        if (arg == "--llm-substitute") {
-            options.enableLlmSubstitution = true;
             continue;
         }
 
@@ -347,6 +424,25 @@ bool ParseArgs(int argc,
             continue;
         }
 
+        if (arg == "--variants") {
+            if (i + 1 >= argc) {
+                error = "Missing value for --variants";
+                return false;
+            }
+            int parsedVariants = 1;
+            if (!ParsePositiveInt(argv[++i], parsedVariants)) {
+                error = "Invalid --variants value: " + std::string(argv[i]);
+                return false;
+            }
+            options.variants = parsedVariants;
+            continue;
+        }
+
+        if (arg == "--select-best-variant") {
+            options.selectBestVariant = true;
+            continue;
+        }
+
         if (arg == "--help" || arg == "-h") {
             wantsHelp = true;
             return false;
@@ -371,23 +467,22 @@ bool ParseArgs(int argc,
         return false;
     }
 
+    if (options.interactive && options.variants > 1) {
+        error = "--variants cannot be combined with --interactive";
+        return false;
+    }
+
     if (options.cleanOutputDir && options.outputDir.empty()) {
         error = "--clean-output-dir requires --output-dir";
         return false;
     }
 
-    return true;
-}
-
-std::string ProgramToText(const Program& program) {
-    std::ostringstream out;
-    for (std::size_t i = 0; i < program.instructions.size(); ++i) {
-        out << InstructionToString(program.instructions[i]);
-        if (i + 1 < program.instructions.size()) {
-            out << "\n";
-        }
+    if (options.runs > 1 && options.variants > 1) {
+        error = "--runs and --variants cannot both be greater than 1";
+        return false;
     }
-    return out.str();
+
+    return true;
 }
 
 std::uint64_t HashText(const std::string& text) {
@@ -423,6 +518,403 @@ bool WriteTextFile(const std::string& path, const std::string& content, std::str
 
     out << content;
     return true;
+}
+
+std::string SafeFileStem(const std::string& path) {
+    std::filesystem::path p(path);
+    std::string stem = p.stem().string();
+    if (stem.empty()) {
+        stem = "run";
+    }
+    for (char& ch : stem) {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '-') {
+            ch = '_';
+        }
+    }
+    return stem;
+}
+
+std::string ResolveArtifactDir(const Options& options) {
+    if (!options.artifactDir.empty()) {
+        return options.artifactDir;
+    }
+    std::filesystem::path outputPath(options.outputPath);
+    std::filesystem::path parent = outputPath.parent_path();
+    std::string dirName = SafeFileStem(options.outputPath) + "_artifacts";
+    if (parent.empty()) {
+        return dirName;
+    }
+    return (parent / dirName).string();
+}
+
+bool EnsureDirectory(const std::string& path, std::string& error) {
+    try {
+        if (!path.empty()) {
+            std::filesystem::create_directories(path);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        error = std::string("Could not create directory: ") + path + " (" + ex.what() + ")";
+        return false;
+    } catch (...) {
+        error = "Could not create directory: " + path;
+        return false;
+    }
+}
+
+bool MaybeWriteProgramArtifact(const std::string& artifactDir,
+                               const std::string& fileName,
+                               const Program& program,
+                               std::string& savedPath,
+                               std::string& error) {
+    if (artifactDir.empty()) {
+        savedPath.clear();
+        return true;
+    }
+    std::filesystem::path path = std::filesystem::path(artifactDir) / fileName;
+    if (!WriteTextFile(path.string(), ProgramToText(program), error)) {
+        return false;
+    }
+    savedPath = path.string();
+    return true;
+}
+
+std::string BuildTransformationTraceMarkdown(const RunSummary& summary) {
+    std::ostringstream out;
+    out << "# AFIS Transformation Trace\n\n";
+    out << "- Input: " << summary.inputPath << "\n";
+    out << "- Output: " << summary.outputPath << "\n";
+    out << "- Seed: " << summary.masterSeed << "\n";
+    out << "- CFG mode: " << (summary.cfgModeEnabled ? "ENABLED" : "DISABLED") << "\n\n";
+
+    out << "## Optimization Totals\n\n";
+    out << "- Constant folds: " << summary.optimizationTrace.constantFolds << "\n";
+    out << "- Constant propagations: " << summary.optimizationTrace.constantPropagations << "\n";
+    out << "- Copy propagations: " << summary.optimizationTrace.copyPropagations << "\n";
+    out << "- Dead instructions removed: " << summary.optimizationTrace.deadInstructionsRemoved << "\n";
+    out << "- Moved instruction slots: " << summary.movedInstructionSlots << "\n";
+    out << "- Moved block slots: " << summary.movedBlockSlots << "\n";
+    out << "- Verification: ";
+    if (!summary.verifyRequested) {
+        out << "NOT RUN\n\n";
+    } else if (!summary.verifyError.empty()) {
+        out << "ERROR\n\n";
+    } else {
+        out << (summary.verifyPass ? "PASS" : "FAIL") << "\n\n";
+    }
+
+    out << "## Stage Artifacts\n\n";
+    if (!summary.originalDumpPath.empty()) {
+        out << "- Original IR: " << summary.originalDumpPath << "\n";
+    }
+    if (!summary.constantFoldDumpPath.empty()) {
+        out << "- After constant folding: " << summary.constantFoldDumpPath << "\n";
+    }
+    if (!summary.constantPropDumpPath.empty()) {
+        out << "- After constant propagation: " << summary.constantPropDumpPath << "\n";
+    }
+    if (!summary.copyPropDumpPath.empty()) {
+        out << "- After copy propagation: " << summary.copyPropDumpPath << "\n";
+    }
+    if (!summary.dceDumpPath.empty()) {
+        out << "- After dead code elimination: " << summary.dceDumpPath << "\n";
+    }
+    if (!summary.optimizedDumpPath.empty()) {
+        out << "- Optimized IR: " << summary.optimizedDumpPath << "\n";
+    }
+    if (!summary.shuffledDumpPath.empty()) {
+        out << "- Shuffled IR: " << summary.shuffledDumpPath << "\n";
+    }
+    if (!summary.finalDumpPath.empty()) {
+        out << "- Final IR: " << summary.finalDumpPath << "\n";
+    }
+    if (!summary.cfgDotPath.empty()) {
+        out << "- CFG dot: " << summary.cfgDotPath << "\n";
+    }
+    if (!summary.dependencyDotPath.empty()) {
+        out << "- Dependency dot: " << summary.dependencyDotPath << "\n";
+    }
+    if (!summary.cfgSvgPath.empty()) {
+        out << "- CFG SVG: " << summary.cfgSvgPath << "\n";
+    }
+    if (!summary.dependencySvgPath.empty()) {
+        out << "- Dependency SVG: " << summary.dependencySvgPath << "\n";
+    }
+    if (!summary.tracePath.empty()) {
+        out << "- Transformation trace: " << summary.tracePath << "\n";
+    }
+    if (!summary.fingerprintReportPath.empty()) {
+        out << "- Fingerprint report: " << summary.fingerprintReportPath << "\n";
+    }
+    if (!summary.verificationPath.empty()) {
+        out << "- Verification text: " << summary.verificationPath << "\n";
+    }
+    if (!summary.workflowDotPath.empty()) {
+        out << "- Workflow dot: " << summary.workflowDotPath << "\n";
+    }
+    if (!summary.workflowSvgPath.empty()) {
+        out << "- Workflow SVG: " << summary.workflowSvgPath << "\n";
+    }
+    out << "\n";
+
+    out << "## Detailed Changes\n\n";
+    if (summary.optimizationTrace.changes.empty()) {
+        out << "No optimization changes were recorded.\n";
+    } else {
+        for (const OptimizationChange& change : summary.optimizationTrace.changes) {
+            out << "### " << change.passName << "\n\n";
+            out << "- Note: " << change.note << "\n";
+            out << "- Before: `" << change.before << "`\n";
+            if (change.removed) {
+                out << "- After: `(removed)`\n\n";
+            } else {
+                out << "- After: `" << change.after << "`\n\n";
+            }
+        }
+    }
+
+    return out.str();
+}
+
+std::string BuildFingerprintMarkdown(const RunSummary& summary) {
+    std::ostringstream out;
+    out << "# AFIS Fingerprint Metrics\n\n";
+    out << "- Original hash: " << FormatHex64(summary.fingerprintMetrics.originalHash) << "\n";
+    out << "- Transformed hash: " << FormatHex64(summary.fingerprintMetrics.transformedHash) << "\n";
+    out << "- Moved instruction slots: " << summary.fingerprintMetrics.movedInstructionSlots << "\n";
+    out << "- Reorder ratio: " << FormatPercent(summary.fingerprintMetrics.reorderRatio) << "\n";
+    out << "- Moved block slots: " << summary.fingerprintMetrics.movedBlockSlots << "\n";
+    out << "- Block reorder ratio: " << FormatPercent(summary.fingerprintMetrics.blockReorderRatio) << "\n";
+    out << "- Renamed symbols: " << summary.fingerprintMetrics.renamedSymbols << "\n";
+    out << "- Diversification score: " << std::fixed << std::setprecision(2)
+        << summary.fingerprintMetrics.diversificationScore << "\n";
+    return out.str();
+}
+
+std::string BuildVerificationText(const RunSummary& summary) {
+    std::ostringstream out;
+    out << "AFIS Verification Result\n";
+    out << "Input: " << summary.inputPath << "\n";
+    out << "Output: " << summary.outputPath << "\n";
+    out << "Verification requested: " << (summary.verifyRequested ? "YES" : "NO") << "\n";
+    if (!summary.verifyRequested) {
+        out << "Status: NOT RUN\n";
+        return out.str();
+    }
+    if (!summary.verifyError.empty()) {
+        out << "Status: ERROR\n";
+        out << "Error: " << summary.verifyError << "\n";
+        return out.str();
+    }
+    out << "Status: " << (summary.verifyPass ? "PASS" : "FAIL") << "\n";
+    out << "Original output:\n" << PrintedOutputToText(summary.originalOutput) << "\n";
+    out << "Transformed output:\n" << PrintedOutputToText(summary.transformedOutput) << "\n";
+    return out.str();
+}
+
+std::vector<WorkflowStepDiagram> BuildWorkflowSteps(const RunSummary& summary) {
+    std::vector<WorkflowStepDiagram> steps;
+    steps.push_back({"Input Parsing", summary.originalDumpPath.empty()
+                                          ? "Parse input IR or convert C++ to IR"
+                                          : "Output: " + summary.originalDumpPath});
+    std::ostringstream optimizationDetail;
+    if (summary.constantFoldDumpPath.empty() && summary.constantPropDumpPath.empty() &&
+        summary.copyPropDumpPath.empty() && summary.dceDumpPath.empty()) {
+        optimizationDetail << "Constant fold, constant propagate, copy propagate, DCE";
+    } else {
+        optimizationDetail << "Fold: "
+                           << (summary.constantFoldDumpPath.empty() ? "(not saved)"
+                                                                   : summary.constantFoldDumpPath)
+                           << "\n";
+        optimizationDetail << "Const-prop: "
+                           << (summary.constantPropDumpPath.empty() ? "(not saved)"
+                                                                   : summary.constantPropDumpPath)
+                           << "\n";
+        optimizationDetail << "Copy-prop: "
+                           << (summary.copyPropDumpPath.empty() ? "(not saved)"
+                                                                : summary.copyPropDumpPath)
+                           << "\n";
+        optimizationDetail << "DCE: "
+                           << (summary.dceDumpPath.empty() ? "(not saved)" : summary.dceDumpPath);
+    }
+    steps.push_back({"Optimization", optimizationDetail.str()});
+    steps.push_back({"CFG / Dependency Analysis",
+                     summary.cfgDotPath.empty() && summary.dependencyDotPath.empty()
+                         ? "Build CFG and dependency graph"
+                         : "CFG: " + summary.cfgDotPath +
+                               (summary.dependencyDotPath.empty()
+                                    ? ""
+                                    : "\nDependency: " + summary.dependencyDotPath)});
+    steps.push_back({"Safe Shuffling / Reordering",
+                     summary.shuffledDumpPath.empty()
+                         ? "Reorder only when hazards and barriers allow it"
+                         : "Output: " + summary.shuffledDumpPath});
+    steps.push_back({"Register Renaming",
+                     summary.finalDumpPath.empty() ? "Rename identifiers consistently"
+                                                   : "Output: " + summary.finalDumpPath});
+    steps.push_back({"Fingerprint Metrics",
+                     summary.fingerprintReportPath.empty()
+                         ? "Compare structural change before vs after"
+                         : "Output: " + summary.fingerprintReportPath});
+    steps.push_back({"Verification",
+                     summary.verificationPath.empty()
+                         ? "Compare original and transformed outputs"
+                         : "Output: " + summary.verificationPath});
+    return steps;
+}
+
+bool SaveAuxiliaryArtifactsIfRequested(const Options& options,
+                                       RunSummary& summary,
+                                       std::string& error) {
+    if (summary.artifactDir.empty()) {
+        return true;
+    }
+
+    std::filesystem::path root(summary.artifactDir);
+
+    if (options.emitTrace) {
+        std::filesystem::path tracePath = root / "trace.md";
+        summary.tracePath = tracePath.string();
+    }
+
+    if (options.emitFingerprintReport) {
+        std::filesystem::path fingerprintPath = root / "fingerprint.md";
+        summary.fingerprintReportPath = fingerprintPath.string();
+        if (!WriteTextFile(summary.fingerprintReportPath, BuildFingerprintMarkdown(summary), error)) {
+            return false;
+        }
+    }
+
+    if (summary.verifyRequested) {
+        std::filesystem::path verificationPath = root / "verification.txt";
+        summary.verificationPath = verificationPath.string();
+        if (!WriteTextFile(summary.verificationPath, BuildVerificationText(summary), error)) {
+            return false;
+        }
+    }
+
+    std::filesystem::path workflowDotPath = root / "workflow.dot";
+    summary.workflowDotPath = workflowDotPath.string();
+    std::filesystem::path workflowSvgPath = root / "workflow.svg";
+    summary.workflowSvgPath = workflowSvgPath.string();
+
+    std::vector<WorkflowStepDiagram> workflowSteps = BuildWorkflowSteps(summary);
+
+    if (!WriteWorkflowDot(workflowSteps, workflowDotPath.string(), error)) {
+        return false;
+    }
+
+    if (!WriteWorkflowSvg(workflowSteps, workflowSvgPath.string(), error)) {
+        return false;
+    }
+
+    if (options.emitTrace) {
+        if (!WriteTextFile(summary.tracePath, BuildTransformationTraceMarkdown(summary), error)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct StageExplanation {
+    std::string title;
+    std::string purpose;
+    std::string runEvidence;
+    std::string safetyReason;
+    std::string artifactPath;
+};
+
+std::vector<StageExplanation> BuildStageExplanations(const RunSummary& summary) {
+    std::vector<StageExplanation> stages;
+    stages.push_back({"Step 1: Input Parsing",
+                      "Convert the input into AFIS IR so later analyses work on one simple internal format.",
+                      summary.originalDumpPath.empty() ? "Original IR artifact was not saved in this run."
+                                                       : "Original IR saved at " + summary.originalDumpPath,
+                      "This stage is safe because it only reads and normalizes the input program before any transformation.",
+                      summary.originalDumpPath});
+
+    std::ostringstream optimizationEvidence;
+    optimizationEvidence << "Folds=" << summary.optimizationTrace.constantFolds
+                         << ", const-prop=" << summary.optimizationTrace.constantPropagations
+                         << ", copy-prop=" << summary.optimizationTrace.copyPropagations
+                         << ", dead removed=" << summary.optimizationTrace.deadInstructionsRemoved;
+    if (!summary.dceDumpPath.empty()) {
+        optimizationEvidence << ". Final optimized IR: " << summary.dceDumpPath;
+    }
+    stages.push_back({"Step 2: Optimization",
+                      "Simplify the IR before shuffling so the later transformation works on cleaner code.",
+                      optimizationEvidence.str(),
+                      "Only local, conservative optimizations are applied, and side-effecting or control-flow instructions are not removed unsafely.",
+                      summary.dceDumpPath});
+
+    std::ostringstream analysisEvidence;
+    analysisEvidence << "RAW=" << summary.hazards.raw << ", WAR=" << summary.hazards.war
+                     << ", WAW=" << summary.hazards.waw << ", barriers=" << summary.hazards.barrier;
+    if (!summary.cfgDotPath.empty()) {
+        analysisEvidence << ". CFG diagram: " << summary.cfgDotPath;
+    }
+    if (!summary.dependencyDotPath.empty()) {
+        analysisEvidence << ". Dependency diagram: " << summary.dependencyDotPath;
+    }
+    stages.push_back({"Step 3: CFG / Dependency Analysis",
+                      "Find which instructions and blocks depend on each other, so AFIS knows what is movable and what must stay ordered.",
+                      analysisEvidence.str(),
+                      "This stage builds legality constraints. Later shuffling is allowed only when these dependency and barrier constraints are respected.",
+                      summary.cfgDotPath.empty() ? summary.dependencyDotPath : summary.cfgDotPath});
+
+    std::ostringstream shuffleEvidence;
+    shuffleEvidence << "Moved instruction slots=" << summary.movedInstructionSlots
+                    << ", moved block slots=" << summary.movedBlockSlots
+                    << ", branch fixups=" << summary.branchFixupsInserted;
+    if (!summary.shuffledDumpPath.empty()) {
+        shuffleEvidence << ". Shuffled IR: " << summary.shuffledDumpPath;
+    }
+    stages.push_back({"Step 4: Safe Shuffling / Reordering",
+                      "Change program layout to reduce fingerprint similarity while preserving valid execution order.",
+                      shuffleEvidence.str(),
+                      "Reordering is restricted by hazards, side-effect barriers, and CFG fixups. The report also tracks side-effect violations, which should stay 0.",
+                      summary.shuffledDumpPath});
+
+    std::ostringstream renameEvidence;
+    renameEvidence << "Renamed symbols=" << summary.renamedSymbols;
+    if (!summary.finalDumpPath.empty()) {
+        renameEvidence << ". Final IR: " << summary.finalDumpPath;
+    }
+    stages.push_back({"Step 5: Register Renaming",
+                      "Rename symbols so the transformed IR looks different even when logic stays the same.",
+                      renameEvidence.str(),
+                      "The renaming map is consistent, so every use and definition of a symbol is rewritten together without changing data flow.",
+                      summary.finalDumpPath});
+
+    std::ostringstream fingerprintEvidence;
+    fingerprintEvidence << "Reorder ratio=" << FormatPercent(summary.reorderRatio)
+                        << ", block reorder ratio=" << FormatPercent(summary.blockReorderRatio)
+                        << ", diversification score=" << std::fixed << std::setprecision(2)
+                        << summary.fingerprintMetrics.diversificationScore;
+    stages.push_back({"Step 6: Fingerprint Metrics",
+                      "Measure how much the transformed program structurally differs from the original one.",
+                      fingerprintEvidence.str(),
+                      "These metrics do not change the program. They help explain anti-fingerprint impact using visible numbers.",
+                      summary.fingerprintReportPath.empty() ? summary.reportHtmlPath
+                                                            : summary.fingerprintReportPath});
+
+    std::string verificationEvidence;
+    if (!summary.verifyRequested) {
+        verificationEvidence = "Verification was not requested in this run.";
+    } else if (!summary.verifyError.empty()) {
+        verificationEvidence = "Verification error: " + summary.verifyError;
+    } else {
+        verificationEvidence = std::string("Verification result: ") +
+                               (summary.verifyPass ? "PASS" : "FAIL");
+    }
+    stages.push_back({"Step 7: Verification",
+                      "Prove that the transformed IR still behaves like the original program.",
+                      verificationEvidence,
+                      "AFIS executes both original and transformed programs and compares their printed outputs directly.",
+                      summary.verificationPath.empty() ? summary.reportHtmlPath : summary.verificationPath});
+
+    return stages;
 }
 
 std::size_t CountMovedInstructions(const std::vector<std::size_t>& order) {
@@ -501,6 +993,46 @@ std::size_t CountSideEffectOrderViolations(const std::vector<Instruction>& befor
     }
 
     return violations;
+}
+
+std::size_t CountUniqueDataSymbols(const Program& program) {
+    std::unordered_set<std::string> symbols;
+    for (const Instruction& inst : program.instructions) {
+        for (const std::string& token : ReadSet(inst)) {
+            if (IsIdentifier(token)) {
+                symbols.insert(token);
+            }
+        }
+        for (const std::string& token : WriteSet(inst)) {
+            if (IsIdentifier(token)) {
+                symbols.insert(token);
+            }
+        }
+    }
+    return symbols.size();
+}
+
+std::size_t CountInstructionsWithOp(const Program& program, OpCode op) {
+    return static_cast<std::size_t>(
+        std::count_if(program.instructions.begin(),
+                      program.instructions.end(),
+                      [op](const Instruction& inst) { return inst.op == op; }));
+}
+
+std::size_t CountBranchInstructions(const Program& program) {
+    return static_cast<std::size_t>(
+        std::count_if(program.instructions.begin(),
+                      program.instructions.end(),
+                      [](const Instruction& inst) {
+                          return inst.op == OpCode::Goto || inst.op == OpCode::IfGoto;
+                      }));
+}
+
+std::size_t CountSideEffectInstructions(const Program& program) {
+    return static_cast<std::size_t>(
+        std::count_if(program.instructions.begin(),
+                      program.instructions.end(),
+                      [](const Instruction& inst) { return IsSideEffectOperation(inst); }));
 }
 
 std::uint64_t DeriveSeed(std::uint64_t baseSeed, std::uint64_t salt) {
@@ -649,29 +1181,36 @@ HazardBreakdown AnalyzeHazards(const Program& program) {
 std::string BuildDeterministicExplanation(const RunSummary& summary) {
     std::ostringstream out;
 
-    out << "The transformation preserved semantics by enforcing dependency and control-flow safety. ";
-    out << "Instruction movement was constrained by hazards (RAW=" << summary.hazards.raw
-        << ", WAR=" << summary.hazards.war << ", WAW=" << summary.hazards.waw
-        << ") and side-effect barriers (" << summary.hazards.barrier << "). ";
-
+    out << "This run started from ";
+    out << (summary.inputMode == "CPP" ? "C++ input converted into IR" : "IR input");
+    out << " and produced a semantics-preserving transformed IR. ";
+    out << "Optimization changed the program with "
+        << summary.optimizationTrace.constantFolds << " folds, "
+        << summary.optimizationTrace.constantPropagations << " constant propagations, "
+        << summary.optimizationTrace.copyPropagations << " copy propagations, and "
+        << summary.optimizationTrace.deadInstructionsRemoved << " dead instructions removed. ";
+    out << "AFIS then reordered " << summary.movedInstructionSlots
+        << " instruction slots";
     if (summary.cfgModeEnabled) {
-        out << "CFG mode reordered basic blocks and inserted " << summary.branchFixupsInserted
-            << " branch fixups to preserve valid fallthrough behavior. ";
-    } else {
-        out << "Straight-line scheduling used randomized topological ordering under dependency constraints. ";
+        out << " and " << summary.movedBlockSlots << " block slots";
     }
-
-    out << "Register renaming changed " << summary.renamedSymbols
-        << " symbols consistently without changing data flow. ";
-
-    if (summary.llmSubstitutionEnabled) {
-        out << "LLM-assisted substitution considered " << summary.substitutionStats.candidateCount
-            << " candidates and applied " << summary.substitutionStats.appliedCount
-            << " validated rewrites. ";
+    out << ", renamed " << summary.renamedSymbols << " symbols, and kept legality under RAW/WAR/WAW/barrier counts of "
+        << summary.hazards.raw << "/" << summary.hazards.war << "/" << summary.hazards.waw
+        << "/" << summary.hazards.barrier << ". ";
+    if (summary.cfgModeEnabled) {
+        out << "CFG-aware reordering inserted " << summary.branchFixupsInserted
+            << " branch fixups where needed. ";
     }
-
+    out << "The transformed program hash changed from " << FormatHex64(summary.originalHash)
+        << " to " << FormatHex64(summary.transformedHash) << ". ";
     if (summary.verifyRequested) {
-        out << "Runtime verification result: " << (summary.verifyPass ? "PASS" : "FAIL") << ".";
+        out << "Verification result: " << (summary.verifyPass ? "PASS" : "FAIL");
+        if (!summary.verifyError.empty()) {
+            out << " (" << summary.verifyError << ")";
+        }
+        out << ".";
+    } else {
+        out << "Verification was not requested.";
     }
 
     return out.str();
@@ -694,25 +1233,63 @@ std::string TruncateForPrompt(const std::string& text, std::size_t maxChars) {
 std::string BuildExplanationPrompt(const RunSummary& summary) {
     std::ostringstream out;
 
-    out << "Explain this compiler IR transformation in concise, viva-friendly language.\n";
-    out << "Focus on why correctness is preserved and what changed.\n\n";
+    out << "Write the executive summary paragraph for an AFIS compiler transformation HTML report.\n";
+    out << "Use 5 concise sentences in one paragraph.\n";
+    out << "Sentence 1: give the verdict, input mode, and verification result.\n";
+    out << "Sentence 2: summarize optimizer effects using the exact optimization counts.\n";
+    out << "Sentence 3: compare the original and transformed fingerprint shape using instruction count, symbol count, and hashes.\n";
+    out << "Sentence 4: summarize movement/diversification using moved instruction slots, moved block slots, branch fixups, renamed symbols, and diversification score.\n";
+    out << "Sentence 5: explain why the transformation stayed safe using hazard counts, side-effect violations, and branch validation.\n";
+    out << "Do not use bullet points, markdown headings, generic theory, or marketing language.\n";
+    out << "Use the exact metric names below. Do not describe instruction reorder ratio as edge movement.\n";
+    out << "Do not invent graph edge counts, performance claims, security claims, or validation methods not listed here.\n";
+    out << "Mention that Gemini is only summarizing run evidence if it fits naturally, but do not make that the main point.\n\n";
 
     out << "Metrics:\n";
+    out << "- Input mode: " << summary.inputMode << "\n";
     out << "- CFG mode: " << (summary.cfgModeEnabled ? "ENABLED" : "DISABLED") << "\n";
-    out << "- Reorder ratio: " << std::fixed << std::setprecision(2) << summary.reorderRatio << "%\n";
-    out << "- Block reorder ratio: " << std::fixed << std::setprecision(2)
+    out << "- Verification requested: " << (summary.verifyRequested ? "YES" : "NO") << "\n";
+    out << "- Verification result: ";
+    if (!summary.verifyRequested) {
+        out << "NOT RUN\n";
+    } else if (!summary.verifyError.empty()) {
+        out << "ERROR (" << summary.verifyError << ")\n";
+    } else {
+        out << (summary.verifyPass ? "PASS" : "FAIL") << "\n";
+    }
+    out << "- Input branch validation: PASS\n";
+    out << "- Output branch validation: PASS\n";
+    out << "- Constant folds: " << summary.optimizationTrace.constantFolds << "\n";
+    out << "- Constant propagations: " << summary.optimizationTrace.constantPropagations << "\n";
+    out << "- Copy propagations: " << summary.optimizationTrace.copyPropagations << "\n";
+    out << "- Dead instructions removed: "
+        << summary.optimizationTrace.deadInstructionsRemoved << "\n";
+    out << "- Original instruction count: " << summary.instructionCount << "\n";
+    out << "- Transformed instruction count: " << summary.transformedInstructionCount << "\n";
+    out << "- Original data symbols: " << summary.originalSymbolCount << "\n";
+    out << "- Transformed data symbols: " << summary.transformedSymbolCount << "\n";
+    out << "- Original side-effect operations: " << summary.originalSideEffectCount << "\n";
+    out << "- Transformed side-effect operations: " << summary.transformedSideEffectCount
+        << "\n";
+    out << "- Original hash: " << FormatHex64(summary.originalHash) << "\n";
+    out << "- Transformed hash: " << FormatHex64(summary.transformedHash) << "\n";
+    out << "- Moved instruction slots: " << summary.movedInstructionSlots << " of "
+        << summary.instructionCount << "\n";
+    out << "- Instruction-slot reorder ratio: " << std::fixed << std::setprecision(2)
+        << summary.reorderRatio << "%\n";
+    out << "- Moved block slots: " << summary.movedBlockSlots << " of " << summary.blockCount
+        << "\n";
+    out << "- Block-slot reorder ratio: " << std::fixed << std::setprecision(2)
         << summary.blockReorderRatio << "%\n";
     out << std::defaultfloat;
     out << "- Branch fixups inserted: " << summary.branchFixupsInserted << "\n";
     out << "- Side-effect violations: " << summary.sideEffectViolations << "\n";
     out << "- Renamed symbols: " << summary.renamedSymbols << "\n";
+    out << "- Diversification score: " << std::fixed << std::setprecision(2)
+        << summary.fingerprintMetrics.diversificationScore << "\n";
+    out << std::defaultfloat;
     out << "- Hazard counts RAW/WAR/WAW/barrier: " << summary.hazards.raw << "/"
         << summary.hazards.war << "/" << summary.hazards.waw << "/" << summary.hazards.barrier << "\n";
-
-    if (summary.llmSubstitutionEnabled) {
-        out << "- Substitution candidates / applied: " << summary.substitutionStats.candidateCount << " / "
-            << summary.substitutionStats.appliedCount << "\n";
-    }
 
     out << "\nSample blocked edges:\n";
     if (summary.hazards.sampleDetails.empty()) {
@@ -819,7 +1396,28 @@ std::string BuildMarkdownReport(const RunSummary& summary) {
     out << "- CFG mode: " << (summary.cfgModeEnabled ? "ENABLED" : "DISABLED") << "\n";
     out << "- Master seed: " << summary.masterSeed << "\n";
     out << "- LLM configured: " << (summary.llmConfigured ? "YES" : "NO") << "\n";
+    out << "- Summary source: "
+        << (summary.explanationFromLlm ? "Gemini" : "deterministic fallback") << "\n";
+    if (!summary.artifactDir.empty()) {
+        out << "- Artifact directory: " << summary.artifactDir << "\n";
+    }
     out << "\n";
+
+    out << "## Optimization Summary\n\n";
+    out << "- Constant folds: " << summary.optimizationTrace.constantFolds << "\n";
+    out << "- Constant propagations: " << summary.optimizationTrace.constantPropagations << "\n";
+    out << "- Copy propagations: " << summary.optimizationTrace.copyPropagations << "\n";
+    out << "- Dead instructions removed: " << summary.optimizationTrace.deadInstructionsRemoved << "\n";
+    out << "\n";
+
+    out << "## Gemini Role\n\n";
+    out << "- Compiler core: deterministic\n";
+    out << "- Gemini role: explanation/report assistance";
+    if (summary.inputMode == "CPP") {
+        out << " and optional C++ to IR frontend help";
+    }
+    out << "\n";
+    out << "- Verification: performed by AFIS itself through original vs transformed output comparison\n\n";
 
     out << "## Metrics\n\n";
     out << "- Instruction count: " << summary.instructionCount << "\n";
@@ -836,18 +1434,10 @@ std::string BuildMarkdownReport(const RunSummary& summary) {
     out << "- Renamed symbols: " << summary.renamedSymbols << "\n";
     out << "- Original IR hash: 0x" << std::hex << summary.originalHash << std::dec << "\n";
     out << "- Transformed IR hash: 0x" << std::hex << summary.transformedHash << std::dec << "\n";
+    out << "- Diversification score: " << std::fixed << std::setprecision(2)
+        << summary.fingerprintMetrics.diversificationScore << "\n";
+    out << std::defaultfloat;
     out << "\n";
-
-    if (summary.llmSubstitutionEnabled) {
-        out << "## LLM-Assisted Substitution\n\n";
-        out << "- Candidates discovered: " << summary.substitutionStats.candidateCount << "\n";
-        out << "- Candidate IDs approved by LLM: " << summary.substitutionStats.llmApprovedCount << "\n";
-        out << "- Substitutions applied: " << summary.substitutionStats.appliedCount << "\n";
-        if (!summary.substitutionNote.empty()) {
-            out << "- Notes: " << summary.substitutionNote << "\n";
-        }
-        out << "\n";
-    }
 
     out << "## Dependency/Hazard Snapshot\n\n";
     out << "- RAW edges: " << summary.hazards.raw << "\n";
@@ -864,10 +1454,90 @@ std::string BuildMarkdownReport(const RunSummary& summary) {
         out << "\n";
     }
 
+    out << "## Demo Artifacts\n\n";
+    if (!summary.originalDumpPath.empty()) {
+        out << "- Original IR: " << summary.originalDumpPath << "\n";
+    }
+    if (!summary.constantFoldDumpPath.empty()) {
+        out << "- After constant folding: " << summary.constantFoldDumpPath << "\n";
+    }
+    if (!summary.constantPropDumpPath.empty()) {
+        out << "- After constant propagation: " << summary.constantPropDumpPath << "\n";
+    }
+    if (!summary.copyPropDumpPath.empty()) {
+        out << "- After copy propagation: " << summary.copyPropDumpPath << "\n";
+    }
+    if (!summary.dceDumpPath.empty()) {
+        out << "- After dead code elimination: " << summary.dceDumpPath << "\n";
+    }
+    if (!summary.optimizedDumpPath.empty()) {
+        out << "- Optimized IR: " << summary.optimizedDumpPath << "\n";
+    }
+    if (!summary.shuffledDumpPath.empty()) {
+        out << "- Shuffled IR: " << summary.shuffledDumpPath << "\n";
+    }
+    if (!summary.finalDumpPath.empty()) {
+        out << "- Final IR: " << summary.finalDumpPath << "\n";
+    }
+    if (!summary.cfgDotPath.empty()) {
+        out << "- CFG dot: " << summary.cfgDotPath << "\n";
+    }
+    if (!summary.dependencyDotPath.empty()) {
+        out << "- Dependency dot: " << summary.dependencyDotPath << "\n";
+    }
+    if (!summary.cfgSvgPath.empty()) {
+        out << "- CFG SVG: " << summary.cfgSvgPath << "\n";
+    }
+    if (!summary.dependencySvgPath.empty()) {
+        out << "- Dependency SVG: " << summary.dependencySvgPath << "\n";
+    }
+    if (!summary.tracePath.empty()) {
+        out << "- Transformation trace: " << summary.tracePath << "\n";
+    }
+    if (!summary.fingerprintReportPath.empty()) {
+        out << "- Fingerprint report: " << summary.fingerprintReportPath << "\n";
+    }
+    if (!summary.verificationPath.empty()) {
+        out << "- Verification text: " << summary.verificationPath << "\n";
+    }
+    if (!summary.workflowDotPath.empty()) {
+        out << "- Workflow dot: " << summary.workflowDotPath << "\n";
+    }
+    if (!summary.workflowSvgPath.empty()) {
+        out << "- Workflow SVG: " << summary.workflowSvgPath << "\n";
+    }
+    if (summary.originalDumpPath.empty() && summary.constantFoldDumpPath.empty() &&
+        summary.constantPropDumpPath.empty() && summary.copyPropDumpPath.empty() &&
+        summary.dceDumpPath.empty() && summary.optimizedDumpPath.empty() &&
+        summary.shuffledDumpPath.empty() && summary.finalDumpPath.empty() &&
+        summary.cfgDotPath.empty() && summary.dependencyDotPath.empty() &&
+        summary.cfgSvgPath.empty() && summary.dependencySvgPath.empty() &&
+        summary.tracePath.empty() && summary.fingerprintReportPath.empty() &&
+        summary.verificationPath.empty() && summary.workflowDotPath.empty() &&
+        summary.workflowSvgPath.empty()) {
+        out << "(No demo artifacts were requested)\n";
+    }
+    out << "\n";
+
+    out << "## Stage-By-Stage Walkthrough\n\n";
+    std::vector<StageExplanation> stageExplanations = BuildStageExplanations(summary);
+    for (const StageExplanation& stage : stageExplanations) {
+        out << "### " << stage.title << "\n\n";
+        out << "- What this step does: " << stage.purpose << "\n";
+        out << "- What happened in this run: " << stage.runEvidence << "\n";
+        out << "- Why this step is safe / useful: " << stage.safetyReason << "\n";
+        if (!stage.artifactPath.empty()) {
+            out << "- Best file to show in demo: " << stage.artifactPath << "\n";
+        }
+        out << "\n";
+    }
+
     out << "## Explanation\n\n";
+    out << "Source: " << (summary.explanationFromLlm ? "Gemini" : "deterministic fallback")
+        << "\n\n";
     out << (summary.explanation.empty() ? "(No explanation generated)" : summary.explanation) << "\n\n";
     if (!summary.explanationError.empty()) {
-        out << "LLM explanation note: " << summary.explanationError << "\n\n";
+        out << "Explanation note: " << summary.explanationError << "\n\n";
     }
 
     out << "## Verification\n\n";
@@ -882,6 +1552,11 @@ std::string BuildMarkdownReport(const RunSummary& summary) {
         out << "Transformed output:\n\n```\n";
         out << PrintedOutputToText(summary.transformedOutput) << "\n```\n\n";
     }
+
+    out << "## IR Snapshots\n\n";
+    out << "### Original IR\n\n```\n" << summary.originalText << "\n```\n\n";
+    out << "### After Optimization\n\n```\n" << summary.optimizedText << "\n```\n\n";
+    out << "### After Safe Shuffling / Reordering\n\n```\n" << summary.shuffledText << "\n```\n\n";
 
     out << "## Rename Map\n\n";
     if (summary.renameMap.empty()) {
@@ -906,7 +1581,7 @@ std::string BuildMarkdownReport(const RunSummary& summary) {
     return out.str();
 }
 
-std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdownBody) {
+std::string BuildHtmlReport(const RunSummary& summary, [[maybe_unused]] const std::string& markdownBody) {
     std::string verificationLabel = "NOT RUN";
     std::string verificationClass = "warn";
     if (summary.verifyRequested) {
@@ -930,6 +1605,44 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
                return a.first < b.first;
             });
 
+    auto fileNameOnly = [](const std::string& path) -> std::string {
+        if (path.empty()) {
+            return "";
+        }
+        return std::filesystem::path(path).filename().string();
+    };
+
+    auto appendArtifactRow = [&](std::ostringstream& out,
+                                 const std::string& label,
+                                 const std::string& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::string name = fileNameOnly(path);
+        out << "<tr><th>" << EscapeHtml(label) << "</th><td><a href=\""
+            << EscapeHtml(name) << "\">" << EscapeHtml(name) << "</a></td></tr>";
+    };
+
+    auto signedDelta = [](std::size_t before, std::size_t after) -> std::string {
+        if (after == before) {
+            return "0";
+        }
+        if (after > before) {
+            return "+" + std::to_string(after - before);
+        }
+        return "-" + std::to_string(before - after);
+    };
+
+    auto appendComparisonRow = [&](std::ostringstream& out,
+                                   const std::string& label,
+                                   const std::string& before,
+                                   const std::string& after,
+                                   const std::string& change) {
+        out << "<tr><th>" << EscapeHtml(label) << "</th><td>" << EscapeHtml(before)
+            << "</td><td>" << EscapeHtml(after) << "</td><td>" << EscapeHtml(change)
+            << "</td></tr>";
+    };
+
     std::ostringstream html;
     html << "<!doctype html>\n";
     html << "<html><head><meta charset=\"utf-8\"/>";
@@ -952,6 +1665,11 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
         << ".value{font-size:1.22rem;font-weight:700;margin-top:4px;}"
         << ".section{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;}"
         << ".section h2{margin:0 0 10px 0;font-size:1.05rem;}"
+        << ".diagram-wrap{background:#fbfdff;border:1px solid var(--line);border-radius:12px;padding:10px;overflow:auto;}"
+        << ".summary{line-height:1.55;font-size:1rem;}"
+        << ".artifact-table a{color:#0f4c81;text-decoration:none;font-weight:600;}"
+        << ".artifact-table a:hover{text-decoration:underline;}"
+        << ".stack{display:grid;gap:10px;}"
         << "table{width:100%;border-collapse:collapse;font-size:0.94rem;}"
         << "th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;}"
         << "th{color:var(--muted);font-weight:600;background:#f8fafc;}"
@@ -975,6 +1693,9 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
     html << "<span class=\"chip\">Seed: " << summary.masterSeed << "</span>";
     html << "<span class=\"chip\">LLM configured: " << (summary.llmConfigured ? "YES" : "NO")
         << "</span>";
+    html << "<span class=\"chip\">Summary: "
+         << (summary.explanationFromLlm ? "Gemini" : "deterministic")
+         << "</span>";
     html << "</div></div>";
 
     html << "<div class=\"grid\">";
@@ -990,6 +1711,10 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
         << summary.branchFixupsInserted << "</div></div>";
     html << "<div class=\"card\"><div class=\"label\">Renamed Symbols</div><div class=\"value\">"
         << summary.renamedSymbols << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Diversification Score</div><div class=\"value\">"
+        << std::fixed << std::setprecision(2) << summary.fingerprintMetrics.diversificationScore
+        << "</div></div>";
+    html << std::defaultfloat;
     html << "<div class=\"card\"><div class=\"label\">Original Hash</div><div class=\"value\">"
         << EscapeHtml(FormatHex64(summary.originalHash)) << "</div></div>";
     html << "<div class=\"card\"><div class=\"label\">Transformed Hash</div><div class=\"value\">"
@@ -1003,7 +1728,144 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
     if (!summary.inputModeNote.empty()) {
        html << "<tr><th>Input mode note</th><td>" << EscapeHtml(summary.inputModeNote) << "</td></tr>";
     }
+    html << "<tr><th>Artifact folder</th><td>" << EscapeHtml(summary.artifactDir) << "</td></tr>";
     html << "</tbody></table></div>";
+
+    html << "<div class=\"section\"><h2>"
+         << (summary.explanationFromLlm ? "Gemini Summary" : "Deterministic Summary")
+         << "</h2>";
+    html << "<div class=\"summary\">" << HtmlWithBreaks(summary.explanation.empty()
+                                                         ? "(No summary generated)"
+                                                         : summary.explanation)
+         << "</div>";
+    if (!summary.explanationError.empty()) {
+        html << "<p><strong>Explanation note:</strong> "
+             << EscapeHtml(summary.explanationError) << "</p>";
+    }
+    html << "</div>";
+
+    html << "<div class=\"section\"><h2>What Changed</h2>";
+    html << "<div class=\"grid\">";
+    html << "<div class=\"card\"><div class=\"label\">Constant Folds</div><div class=\"value\">"
+        << summary.optimizationTrace.constantFolds << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Constant Propagations</div><div class=\"value\">"
+        << summary.optimizationTrace.constantPropagations << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Copy Propagations</div><div class=\"value\">"
+        << summary.optimizationTrace.copyPropagations << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Dead Instructions Removed</div><div class=\"value\">"
+        << summary.optimizationTrace.deadInstructionsRemoved << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Moved Instruction Slots</div><div class=\"value\">"
+        << summary.movedInstructionSlots << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Moved Block Slots</div><div class=\"value\">"
+        << summary.movedBlockSlots << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Branch Fixups</div><div class=\"value\">"
+        << summary.branchFixupsInserted << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Renamed Symbols</div><div class=\"value\">"
+        << summary.renamedSymbols << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Side-Effect Violations</div><div class=\"value\">"
+        << summary.sideEffectViolations << "</div></div>";
+    html << "<div class=\"card\"><div class=\"label\">Shuffle Fallbacks</div><div class=\"value\">"
+        << summary.shuffleFallbacksUsed << "</div></div>";
+    html << "</div></div>";
+
+    html << "<div class=\"section\"><h2>Fingerprint Comparison</h2>";
+    html << "<table><thead><tr><th>Metric</th><th>Original</th><th>Transformed</th><th>Change</th></tr></thead><tbody>";
+    appendComparisonRow(html,
+                        "IR hash",
+                        FormatHex64(summary.originalHash),
+                        FormatHex64(summary.transformedHash),
+                        summary.originalHash == summary.transformedHash ? "same" : "changed");
+    appendComparisonRow(html,
+                        "Instruction count",
+                        std::to_string(summary.instructionCount),
+                        std::to_string(summary.transformedInstructionCount),
+                        signedDelta(summary.instructionCount, summary.transformedInstructionCount));
+    appendComparisonRow(html,
+                        "Basic blocks",
+                        std::to_string(summary.blockCount),
+                        std::to_string(summary.transformedBlockCount),
+                        signedDelta(summary.blockCount, summary.transformedBlockCount));
+    appendComparisonRow(html,
+                        "Data symbols",
+                        std::to_string(summary.originalSymbolCount),
+                        std::to_string(summary.transformedSymbolCount),
+                        signedDelta(summary.originalSymbolCount, summary.transformedSymbolCount));
+    appendComparisonRow(html,
+                        "Labels",
+                        std::to_string(summary.originalLabelCount),
+                        std::to_string(summary.transformedLabelCount),
+                        signedDelta(summary.originalLabelCount, summary.transformedLabelCount));
+    appendComparisonRow(html,
+                        "Branch instructions",
+                        std::to_string(summary.originalBranchCount),
+                        std::to_string(summary.transformedBranchCount),
+                        signedDelta(summary.originalBranchCount, summary.transformedBranchCount));
+    appendComparisonRow(html,
+                        "Side-effect operations",
+                        std::to_string(summary.originalSideEffectCount),
+                        std::to_string(summary.transformedSideEffectCount),
+                        signedDelta(summary.originalSideEffectCount, summary.transformedSideEffectCount));
+    html << "</tbody></table></div>";
+
+    html << "<div class=\"section\"><h2>Diversification Metrics</h2>";
+    html << "<table><tbody>";
+    html << "<tr><th>Moved instruction slots</th><td>" << summary.fingerprintMetrics.movedInstructionSlots
+        << " / " << summary.instructionCount << "</td></tr>";
+    html << "<tr><th>Reorder ratio</th><td>" << EscapeHtml(FormatPercent(summary.fingerprintMetrics.reorderRatio))
+        << "</td></tr>";
+    html << "<tr><th>Moved block slots</th><td>" << summary.fingerprintMetrics.movedBlockSlots
+        << " / " << summary.blockCount << "</td></tr>";
+    html << "<tr><th>Block reorder ratio</th><td>"
+        << EscapeHtml(FormatPercent(summary.fingerprintMetrics.blockReorderRatio)) << "</td></tr>";
+    html << "<tr><th>Renamed symbols</th><td>" << summary.fingerprintMetrics.renamedSymbols << "</td></tr>";
+    html << "<tr><th>Original hash</th><td>" << EscapeHtml(FormatHex64(summary.fingerprintMetrics.originalHash))
+        << "</td></tr>";
+    html << "<tr><th>Transformed hash</th><td>"
+        << EscapeHtml(FormatHex64(summary.fingerprintMetrics.transformedHash)) << "</td></tr>";
+    html << "<tr><th>Diversification score</th><td>" << std::fixed << std::setprecision(2)
+        << summary.fingerprintMetrics.diversificationScore << "</td></tr>";
+    html << std::defaultfloat;
+    html << "</tbody></table></div>";
+
+    html << "<div class=\"section\"><h2>Artifacts</h2>";
+    html << "<table class=\"artifact-table\"><tbody>";
+    appendArtifactRow(html, "Original IR", summary.originalDumpPath);
+    appendArtifactRow(html, "After Constant Fold", summary.constantFoldDumpPath);
+    appendArtifactRow(html, "After Constant Propagation", summary.constantPropDumpPath);
+    appendArtifactRow(html, "After Copy Propagation", summary.copyPropDumpPath);
+    appendArtifactRow(html, "After Dead Code Elimination", summary.dceDumpPath);
+    appendArtifactRow(html, "After Shuffling", summary.shuffledDumpPath);
+    appendArtifactRow(html, "Final IR", summary.finalDumpPath);
+    appendArtifactRow(html, "CFG Graph", summary.cfgSvgPath);
+    appendArtifactRow(html, "Dependency Graph", summary.dependencySvgPath);
+    appendArtifactRow(html, "Transformation Trace", summary.tracePath);
+    appendArtifactRow(html, "Fingerprint Report", summary.fingerprintReportPath);
+    appendArtifactRow(html, "Verification Text", summary.verificationPath);
+    appendArtifactRow(html, "Transformed IR Output", summary.outputPath);
+    appendArtifactRow(html, "This HTML Report", summary.reportHtmlPath);
+    html << "</tbody></table></div>";
+
+    html << "<div class=\"section\"><h2>Compiler Graphs</h2>";
+    if (!summary.cfgSvgPath.empty()) {
+        html << "<h3>Control Flow Graph</h3><div class=\"diagram-wrap\"><img src=\""
+             << EscapeHtml(fileNameOnly(summary.cfgSvgPath))
+             << "\" alt=\"CFG diagram\" style=\"max-width:100%;height:auto;\"/></div>";
+    }
+    if (!summary.dependencySvgPath.empty()) {
+        html << "<h3>Dependency Graph</h3><div class=\"diagram-wrap\"><img src=\""
+             << EscapeHtml(fileNameOnly(summary.dependencySvgPath))
+             << "\" alt=\"Dependency diagram\" style=\"max-width:100%;height:auto;\"/></div>";
+    }
+    html << "</div>";
+
+    html << "<div class=\"section\"><h2>IR Snapshots</h2>";
+    html << "<div class=\"stack\">";
+    html << "<div><h3>Original IR</h3><pre>" << EscapeHtml(summary.originalText) << "</pre></div>";
+    html << "<div><h3>After Optimization</h3><pre>" << EscapeHtml(summary.optimizedText) << "</pre></div>";
+    html << "<div><h3>After Safe Shuffling / Reordering</h3><pre>" << EscapeHtml(summary.shuffledText) << "</pre></div>";
+    html << "<div><h3>Final IR After Renaming</h3><pre>" << EscapeHtml(summary.transformedText) << "</pre></div>";
+    html << "</div>";
+    html << "</div>";
 
     html << "<div class=\"section\"><h2>Hazard Snapshot</h2>";
     html << "<table><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody>";
@@ -1018,29 +1880,6 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
           html << "<li>" << EscapeHtml(detail) << "</li>";
        }
        html << "</ul>";
-    }
-    html << "</div>";
-
-    if (summary.llmSubstitutionEnabled) {
-       html << "<div class=\"section\"><h2>LLM-Assisted Substitution</h2>";
-       html << "<table><tbody>";
-       html << "<tr><th>Candidates discovered</th><td>" << summary.substitutionStats.candidateCount
-           << "</td></tr>";
-       html << "<tr><th>IDs approved by LLM</th><td>" << summary.substitutionStats.llmApprovedCount
-           << "</td></tr>";
-       html << "<tr><th>Substitutions applied</th><td>" << summary.substitutionStats.appliedCount
-           << "</td></tr>";
-       if (!summary.substitutionNote.empty()) {
-          html << "<tr><th>Note</th><td>" << EscapeHtml(summary.substitutionNote) << "</td></tr>";
-       }
-       html << "</tbody></table></div>";
-    }
-
-    html << "<div class=\"section\"><h2>Explanation</h2><p>";
-    html << HtmlWithBreaks(summary.explanation.empty() ? "(No explanation generated)" : summary.explanation);
-    html << "</p>";
-    if (!summary.explanationError.empty()) {
-       html << "<p><strong>LLM note:</strong> " << EscapeHtml(summary.explanationError) << "</p>";
     }
     html << "</div>";
 
@@ -1071,12 +1910,6 @@ std::string BuildHtmlReport(const RunSummary& summary, const std::string& markdo
        html << "</tbody></table>";
     }
     html << "</div>";
-
-    html << "<div class=\"section\"><h2>Transformed IR</h2><pre>"
-        << EscapeHtml(summary.transformedText) << "</pre></div>";
-
-    html << "<div class=\"section\"><details><summary>Raw Markdown Report</summary><pre>"
-        << EscapeHtml(markdownBody) << "</pre></details></div>";
 
     html << "</div>";
     html << "</body></html>\n";
@@ -1125,56 +1958,6 @@ bool ParseInputProgram(const Options& options,
     return true;
 }
 
-void MaybeRunLlmSubstitution(const Options& options,
-                             const GeminiClient& gemini,
-                             Program& reordered,
-                             SubstitutionStats& substitutionStats,
-                             std::string& substitutionNote) {
-    substitutionStats = SubstitutionStats{};
-    substitutionNote.clear();
-
-    if (!options.enableLlmSubstitution) {
-        return;
-    }
-
-    std::vector<SubstitutionCandidate> candidates = FindSafeSubstitutionCandidates(reordered);
-    if (candidates.empty()) {
-        substitutionStats.candidateCount = 0;
-        substitutionNote = "No safe substitution candidates were found.";
-        return;
-    }
-
-    std::vector<std::size_t> approvedIds;
-
-    if (gemini.IsConfigured()) {
-        const std::string systemPrompt =
-            "You are a strict compiler safety checker. "
-            "Pick only candidate IDs that are safe for exact integer semantic equivalence. "
-            "Return only comma-separated integers.";
-
-        std::string userPrompt = BuildSubstitutionSelectionPrompt(reordered, candidates);
-        LlmResult llm = gemini.GenerateText(systemPrompt, userPrompt, 0.1);
-        if (llm.ok) {
-            std::string cleaned = StripMarkdownCodeFences(llm.text);
-            approvedIds = ParseApprovedCandidateIds(cleaned);
-            substitutionNote = "LLM candidate selection completed.";
-        } else {
-            substitutionNote = "LLM substitution selection failed: " + llm.error;
-        }
-    } else {
-        substitutionNote = "LLM is not configured; substitution selection skipped.";
-    }
-
-    reordered = ApplyApprovedSubstitutions(reordered, candidates, approvedIds, substitutionStats);
-
-    if (!approvedIds.empty() && substitutionStats.appliedCount == 0) {
-        if (!substitutionNote.empty()) {
-            substitutionNote += " ";
-        }
-        substitutionNote += "LLM-approved IDs did not pass deterministic validation.";
-    }
-}
-
 void MaybeRunLlmExplanation(const Options& options,
                             const GeminiClient& gemini,
                             RunSummary& summary) {
@@ -1220,21 +2003,22 @@ bool SaveReportsIfRequested(const Options& options, RunSummary& summary, std::st
         return true;
     }
 
-    std::string markdownPath = options.reportPath;
-    if (markdownPath.empty()) {
-        markdownPath = "build/llm_report_latest.md";
-    }
+    summary.reportPath = options.reportPath;
+    summary.reportHtmlPath =
+        options.reportHtmlPath.empty() && options.enableLlmExplanation
+            ? "build/llm_report_latest.html"
+            : options.reportHtmlPath;
 
     std::string markdown = BuildMarkdownReport(summary);
-    if (!WriteTextFile(markdownPath, markdown, error)) {
-        return false;
+    if (!options.reportPath.empty()) {
+        if (!WriteTextFile(options.reportPath, markdown, error)) {
+            return false;
+        }
+    } else {
+        summary.reportPath.clear();
     }
-    summary.reportPath = markdownPath;
 
-    std::string htmlPath = options.reportHtmlPath;
-    if (htmlPath.empty() && options.enableLlmExplanation) {
-        htmlPath = "build/llm_report_latest.html";
-    }
+    std::string htmlPath = summary.reportHtmlPath;
     if (!htmlPath.empty()) {
         std::string html = BuildHtmlReport(summary, markdown);
         if (!WriteTextFile(htmlPath, html, error)) {
@@ -1246,12 +2030,16 @@ bool SaveReportsIfRequested(const Options& options, RunSummary& summary, std::st
     return true;
 }
 
+bool WantsArtifactOutput(const Options& options) {
+    return options.dumpPasses || options.emitCfgDot || options.emitDependencyDot ||
+           options.emitTrace || options.emitFingerprintReport || !options.artifactDir.empty();
+}
+
 int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     summary = RunSummary{};
     summary.inputPath = options.inputPath;
     summary.outputPath = options.outputPath;
     summary.verifyRequested = options.verify;
-    summary.llmSubstitutionEnabled = options.enableLlmSubstitution;
     summary.llmExplanationEnabled = options.enableLlmExplanation;
 
     GeminiConfig geminiConfig = LoadGeminiConfigFromEnvFile(options.envPath);
@@ -1272,10 +2060,57 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
 
     summary.originalText = ProgramToText(original);
 
+    if (WantsArtifactOutput(options)) {
+        summary.artifactDir = ResolveArtifactDir(options);
+        std::string dirError;
+        if (!EnsureDirectory(summary.artifactDir, dirError)) {
+            std::cerr << dirError << "\n";
+            return 1;
+        }
+    }
+
     BranchValidationResult inputValidation = ValidateBranches(original);
     if (!inputValidation.success) {
         std::cerr << "Input control-flow validation failed: " << inputValidation.error << "\n";
         return 1;
+    }
+
+    OptimizationPipelineResult optimization = RunOptimizationPipeline(original);
+    summary.optimizationTrace = optimization.trace;
+    Program optimized = optimization.afterDeadCodeElimination;
+    summary.optimizedText = ProgramToText(optimized);
+
+    std::string artifactError;
+    if (options.dumpPasses) {
+        if (!MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "01_original.ir",
+                                       original,
+                                       summary.originalDumpPath,
+                                       artifactError) ||
+            !MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "02_constant_fold.ir",
+                                       optimization.afterConstantFolding,
+                                       summary.constantFoldDumpPath,
+                                       artifactError) ||
+            !MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "03_constant_propagation.ir",
+                                       optimization.afterConstantPropagation,
+                                       summary.constantPropDumpPath,
+                                       artifactError) ||
+            !MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "04_copy_propagation.ir",
+                                       optimization.afterCopyPropagation,
+                                       summary.copyPropDumpPath,
+                                       artifactError) ||
+            !MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "05_dead_code_elimination.ir",
+                                       optimization.afterDeadCodeElimination,
+                                       summary.dceDumpPath,
+                                       artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
+        summary.optimizedDumpPath = summary.dceDumpPath;
     }
 
     std::uint64_t masterSeed = options.hasSeed ? options.seed : GenerateRandomSeed();
@@ -1286,36 +2121,81 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     BlockReorderStats blockStats;
     std::size_t sideEffectViolations = 0;
     std::size_t shuffleFallbackCount = 0;
-    bool cfgModeEnabled = HasExplicitControlFlow(original);
+    bool cfgModeEnabled = HasExplicitControlFlow(optimized);
 
-    if (cfgModeEnabled) {
-        CFG cfg;
-        std::string cfgError;
-        if (!BuildCFG(original, cfg, cfgError)) {
-            std::cerr << "CFG build failed: " << cfgError << "\n";
+    CFG optimizedCfg;
+    std::string optimizedCfgError;
+    if (!BuildCFG(optimized, optimizedCfg, optimizedCfgError)) {
+        std::cerr << "Optimized CFG build failed: " << optimizedCfgError << "\n";
+        return 1;
+    }
+
+    if (options.emitCfgDot) {
+        std::filesystem::path cfgPath = std::filesystem::path(summary.artifactDir) / "cfg.dot";
+        if (!WriteCfgDot(optimizedCfg, cfgPath.string(), artifactError)) {
+            std::cerr << artifactError << "\n";
             return 1;
         }
+        summary.cfgDotPath = cfgPath.string();
+    }
+    if (WantsArtifactOutput(options)) {
+        std::filesystem::path cfgSvgPath = std::filesystem::path(summary.artifactDir) / "cfg.svg";
+        if (!WriteCfgSvg(optimizedCfg, cfgSvgPath.string(), artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
+        summary.cfgSvgPath = cfgSvgPath.string();
+    }
 
+    if (options.emitDependencyDot) {
+        DependencyGraph optimizedGraph = BuildDependencyGraph(optimized);
+        std::filesystem::path depPath = std::filesystem::path(summary.artifactDir) / "dependency.dot";
+        if (!WriteDependencyDot(optimized, optimizedGraph, depPath.string(), artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
+        summary.dependencyDotPath = depPath.string();
+        if (WantsArtifactOutput(options)) {
+            std::filesystem::path depSvgPath = std::filesystem::path(summary.artifactDir) / "dependency.svg";
+            if (!WriteDependencySvg(optimized, optimizedGraph, depSvgPath.string(), artifactError)) {
+                std::cerr << artifactError << "\n";
+                return 1;
+            }
+            summary.dependencySvgPath = depSvgPath.string();
+        }
+    } else if (WantsArtifactOutput(options)) {
+        DependencyGraph optimizedGraph = BuildDependencyGraph(optimized);
+        std::filesystem::path depSvgPath = std::filesystem::path(summary.artifactDir) / "dependency.svg";
+        if (!WriteDependencySvg(optimized, optimizedGraph, depSvgPath.string(), artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
+        summary.dependencySvgPath = depSvgPath.string();
+    }
+
+    if (cfgModeEnabled) {
         std::size_t movedInsideBlocks = 0;
-        for (std::size_t i = 0; i < cfg.blocks.size(); ++i) {
-            ShuffleBlockBody(cfg.blocks[i],
+        for (std::size_t i = 0; i < optimizedCfg.blocks.size(); ++i) {
+            ShuffleBlockBody(optimizedCfg.blocks[i],
                              DeriveSeed(shuffleSeed, static_cast<std::uint64_t>(i + 1)),
                              movedInsideBlocks,
                              sideEffectViolations,
                              shuffleFallbackCount);
         }
 
-        reordered = ReorderBasicBlocks(cfg, DeriveSeed(shuffleSeed, 0xC0FFEEULL), blockStats);
+        reordered =
+            ReorderBasicBlocks(optimizedCfg, DeriveSeed(shuffleSeed, 0xC0FFEEULL), blockStats);
     } else {
-        DependencyGraph graph = BuildDependencyGraph(original);
-        ShuffleResult shuffled = RandomizedTopologicalShuffle(original, graph, shuffleSeed);
+        DependencyGraph graph = BuildDependencyGraph(optimized);
+        ShuffleResult shuffled = RandomizedTopologicalShuffle(optimized, graph, shuffleSeed);
 
         if (!shuffled.fallbackUsed && CountMovedInstructions(shuffled.order) == 0 &&
-            original.instructions.size() > 1) {
+            optimized.instructions.size() > 1) {
             std::uint64_t candidateSeed = shuffleSeed;
             for (int attempt = 0; attempt < 16; ++attempt) {
                 candidateSeed += 0x9E3779B97F4A7C15ULL;
-                ShuffleResult candidate = RandomizedTopologicalShuffle(original, graph, candidateSeed);
+                ShuffleResult candidate =
+                    RandomizedTopologicalShuffle(optimized, graph, candidateSeed);
                 if (!candidate.fallbackUsed && CountMovedInstructions(candidate.order) > 0) {
                     shuffled = std::move(candidate);
                     break;
@@ -1324,7 +2204,8 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
         }
 
         reordered = shuffled.program;
-        sideEffectViolations = CountSideEffectOrderViolations(original.instructions, reordered.instructions);
+        sideEffectViolations =
+            CountSideEffectOrderViolations(optimized.instructions, reordered.instructions);
         if (shuffled.fallbackUsed) {
             shuffleFallbackCount = 1;
         }
@@ -1334,9 +2215,17 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
         blockStats.order = {0};
     }
 
-    SubstitutionStats substitutionStats;
-    std::string substitutionNote;
-    MaybeRunLlmSubstitution(options, gemini, reordered, substitutionStats, substitutionNote);
+    summary.shuffledText = ProgramToText(reordered);
+    if (options.dumpPasses) {
+        if (!MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "06_shuffled.ir",
+                                       reordered,
+                                       summary.shuffledDumpPath,
+                                       artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
+    }
 
     {
         CFG transformedCfg;
@@ -1357,11 +2246,30 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
 
     Program transformed = renamed.program;
     std::string transformedText = ProgramToText(transformed);
+    summary.transformedText = transformedText;
+
+    CFG finalTransformedCfg;
+    std::string finalTransformedCfgError;
+    if (!BuildCFG(transformed, finalTransformedCfg, finalTransformedCfgError)) {
+        std::cerr << "Final transformed CFG build failed: " << finalTransformedCfgError << "\n";
+        return 1;
+    }
 
     std::string writeError;
     if (!WriteTextFile(options.outputPath, transformedText, writeError)) {
         std::cerr << writeError << "\n";
         return 1;
+    }
+
+    if (options.dumpPasses) {
+        if (!MaybeWriteProgramArtifact(summary.artifactDir,
+                                       "07_final.ir",
+                                       transformed,
+                                       summary.finalDumpPath,
+                                       artifactError)) {
+            std::cerr << artifactError << "\n";
+            return 1;
+        }
     }
 
     std::size_t moved = CountMovedOriginalInstructionSlots(original, transformed);
@@ -1377,10 +2285,26 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     std::string originalText = ProgramToText(original);
     std::uint64_t originalHash = HashText(originalText);
     std::uint64_t transformedHash = HashText(transformedText);
+    CFG originalMetricCfg;
+    std::string originalMetricCfgError;
+    if (!BuildCFG(original, originalMetricCfg, originalMetricCfgError)) {
+        std::cerr << "Original CFG metrics build failed: " << originalMetricCfgError << "\n";
+        return 1;
+    }
 
     summary.cfgModeEnabled = cfgModeEnabled;
     summary.instructionCount = original.instructions.size();
-    summary.blockCount = blockStats.blockCount;
+    summary.blockCount = originalMetricCfg.blocks.size();
+    summary.transformedInstructionCount = transformed.instructions.size();
+    summary.transformedBlockCount = finalTransformedCfg.blocks.size();
+    summary.originalSymbolCount = CountUniqueDataSymbols(original);
+    summary.transformedSymbolCount = CountUniqueDataSymbols(transformed);
+    summary.originalLabelCount = CountInstructionsWithOp(original, OpCode::Label);
+    summary.transformedLabelCount = CountInstructionsWithOp(transformed, OpCode::Label);
+    summary.originalBranchCount = CountBranchInstructions(original);
+    summary.transformedBranchCount = CountBranchInstructions(transformed);
+    summary.originalSideEffectCount = CountSideEffectInstructions(original);
+    summary.transformedSideEffectCount = CountSideEffectInstructions(transformed);
     summary.masterSeed = masterSeed;
     summary.movedInstructionSlots = moved;
     summary.reorderRatio = reorderRatio;
@@ -1392,10 +2316,14 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     summary.renamedSymbols = renamed.renameMap.size();
     summary.originalHash = originalHash;
     summary.transformedHash = transformedHash;
+    summary.fingerprintMetrics = BuildFingerprintMetrics(moved,
+                                                         reorderRatio,
+                                                         blockStats.movedBlockSlots,
+                                                         blockReorderRatio,
+                                                         renamed.renameMap.size(),
+                                                         originalHash,
+                                                         transformedHash);
     summary.renameMap = renamed.renameMap;
-    summary.transformedText = transformedText;
-    summary.substitutionStats = substitutionStats;
-    summary.substitutionNote = substitutionNote;
     summary.hazards = AnalyzeHazards(original);
 
     std::cout << "Anti-Fingerprint Instruction Shuffler Summary\n";
@@ -1427,18 +2355,19 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     std::cout << "Renamed symbols           : " << renamed.renameMap.size() << "\n";
     std::cout << "Original IR hash          : 0x" << std::hex << originalHash << std::dec << "\n";
     std::cout << "Transformed IR hash       : 0x" << std::hex << transformedHash << std::dec << "\n";
+    std::cout << "Diversification score     : " << std::fixed << std::setprecision(2)
+              << summary.fingerprintMetrics.diversificationScore << "\n";
+    std::cout << std::defaultfloat;
+    std::cout << "Optimization summary      : folds=" << summary.optimizationTrace.constantFolds
+              << ", const-prop=" << summary.optimizationTrace.constantPropagations
+              << ", copy-prop=" << summary.optimizationTrace.copyPropagations
+              << ", dce-removed=" << summary.optimizationTrace.deadInstructionsRemoved << "\n";
 
     std::cout << "LLM configured            : " << (summary.llmConfigured ? "YES" : "NO") << "\n";
-    std::cout << "LLM substitution enabled  : "
-              << (options.enableLlmSubstitution ? "YES" : "NO") << "\n";
-    if (options.enableLlmSubstitution) {
-        std::cout << "Substitution candidates   : " << substitutionStats.candidateCount << "\n";
-        std::cout << "Substitution approved IDs : " << substitutionStats.llmApprovedCount << "\n";
-        std::cout << "Substitutions applied     : " << substitutionStats.appliedCount << "\n";
-        if (!substitutionNote.empty()) {
-            std::cout << "Substitution note         : " << substitutionNote << "\n";
-        }
-    }
+    std::cout << "LLM explanation enabled   : "
+              << (options.enableLlmExplanation ? "YES" : "NO") << "\n";
+    std::cout << "LLM C++ assistance        : "
+              << (options.preferLlmCpp ? "ENABLED" : "DISABLED") << "\n";
 
     int exitCode = 0;
 
@@ -1483,9 +2412,20 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
     if (options.enableLlmExplanation) {
         std::cout << "\nExplanation\n";
         std::cout << "-----------\n";
+        std::cout << "Explanation source        : "
+                  << (summary.explanationFromLlm ? "Gemini" : "deterministic fallback")
+                  << "\n";
         std::cout << summary.explanation << "\n";
         if (!summary.explanationError.empty()) {
             std::cout << "Explanation note          : " << summary.explanationError << "\n";
+        }
+    }
+
+    std::string auxiliaryArtifactError;
+    if (!SaveAuxiliaryArtifactsIfRequested(options, summary, auxiliaryArtifactError)) {
+        std::cerr << "Artifact generation failed: " << auxiliaryArtifactError << "\n";
+        if (exitCode == 0) {
+            exitCode = 4;
         }
     }
 
@@ -1504,9 +2444,26 @@ int ExecuteSingleRun(const Options& options, RunSummary& summary) {
         }
     }
 
+    if (!summary.tracePath.empty()) {
+        std::cout << "Transformation trace      : " << summary.tracePath << "\n";
+    }
+    if (!summary.fingerprintReportPath.empty()) {
+        std::cout << "Fingerprint report        : " << summary.fingerprintReportPath << "\n";
+    }
+    if (!summary.verificationPath.empty()) {
+        std::cout << "Verification artifact     : " << summary.verificationPath << "\n";
+    }
+    if (!summary.workflowSvgPath.empty()) {
+        std::cout << "Workflow diagram          : " << summary.workflowSvgPath << "\n";
+    }
+
     if (options.showMap) {
         std::cout << "\n";
         PrintRenameMap(renamed.renameMap);
+    }
+
+    if (!summary.artifactDir.empty()) {
+        std::cout << "Artifact directory        : " << summary.artifactDir << "\n";
     }
 
     return exitCode;
@@ -1591,6 +2548,16 @@ int ExecuteBatchRuns(const Options& options) {
         runOptions.interactive = false;
         runOptions.cleanOutputDir = false;
         runOptions.outputPath = BuildBatchOutputPath(options, runIndex);
+        if (WantsArtifactOutput(options)) {
+            std::ostringstream artifactName;
+            artifactName << "run_" << runIndex;
+            if (!options.artifactDir.empty()) {
+                runOptions.artifactDir =
+                    (std::filesystem::path(options.artifactDir) / artifactName.str()).string();
+            } else {
+                runOptions.artifactDir.clear();
+            }
+        }
 
         if (options.hasSeed) {
             runOptions.hasSeed = true;
@@ -1658,6 +2625,150 @@ int ExecuteBatchRuns(const Options& options) {
     for (const std::string& path : outputPaths) {
         std::cout << "  " << path << "\n";
     }
+
+    return 0;
+}
+
+std::string BuildVariantOutputPath(const Options& options, int variantIndex) {
+    std::filesystem::path outputPath(options.outputPath);
+    std::filesystem::path parent = outputPath.parent_path();
+    std::string stem = outputPath.stem().string();
+    std::string ext = outputPath.extension().string();
+    if (stem.empty()) {
+        stem = "transformed";
+    }
+    if (ext.empty()) {
+        ext = ".ir";
+    }
+    std::ostringstream name;
+    name << stem << "_variant_" << variantIndex << ext;
+    if (parent.empty()) {
+        return name.str();
+    }
+    return (parent / name.str()).string();
+}
+
+std::string BuildVariantArtifactDir(const Options& options, int variantIndex) {
+    std::filesystem::path root = options.artifactDir.empty()
+                                     ? std::filesystem::path("build") / "variants" / SafeFileStem(options.outputPath)
+                                     : std::filesystem::path(options.artifactDir);
+    std::ostringstream name;
+    name << "variant_" << variantIndex;
+    return (root / name.str()).string();
+}
+
+std::string BuildVariantSummaryMarkdown(const std::vector<RunSummary>& variants,
+                                        int bestIndex,
+                                        bool chooseBest) {
+    std::ostringstream out;
+    out << "# AFIS Variant Summary\n\n";
+    out << "| Variant | Output | Verification | Reorder % | Block Reorder % | Renamed | Score |\n";
+    out << "|---|---|---|---:|---:|---:|---:|\n";
+    for (std::size_t i = 0; i < variants.size(); ++i) {
+        const RunSummary& summary = variants[i];
+        std::string verification = "NOT RUN";
+        if (summary.verifyRequested) {
+            verification = summary.verifyError.empty() ? (summary.verifyPass ? "PASS" : "FAIL") : "ERROR";
+        }
+        out << "| " << (i + 1) << " | " << summary.outputPath << " | " << verification << " | "
+            << std::fixed << std::setprecision(2) << summary.reorderRatio << " | "
+            << std::fixed << std::setprecision(2) << summary.blockReorderRatio << " | "
+            << summary.renamedSymbols << " | "
+            << std::fixed << std::setprecision(2) << summary.fingerprintMetrics.diversificationScore
+            << " |\n";
+    }
+    out << "\n";
+    if (chooseBest && bestIndex >= 0) {
+        const RunSummary& best = variants[bestIndex];
+        out << "Selected best variant: " << (bestIndex + 1) << "\n";
+        out << "- Output path: " << best.outputPath << "\n";
+        out << "- Artifact directory: " << best.artifactDir << "\n";
+        out << "- Verification: " << (best.verifyRequested ? (best.verifyPass ? "PASS" : "FAIL")
+                                                          : "NOT RUN")
+            << "\n";
+        out << "- Diversification score: " << std::fixed << std::setprecision(2)
+            << best.fingerprintMetrics.diversificationScore << "\n";
+        out << "- Reason: highest valid diversification score among generated variants.\n";
+    } else {
+        out << "Best-variant selection not requested.\n";
+    }
+    return out.str();
+}
+
+int ExecuteVariantRuns(const Options& options) {
+    std::vector<RunSummary> variantSummaries;
+    variantSummaries.reserve(options.variants);
+
+    int bestIndex = -1;
+    double bestScore = -1.0;
+
+    for (int variantIndex = 1; variantIndex <= options.variants; ++variantIndex) {
+        Options variantOptions = options;
+        variantOptions.variants = 1;
+        variantOptions.runs = 1;
+        variantOptions.interactive = false;
+        variantOptions.cleanOutputDir = false;
+        variantOptions.dumpPasses = true;
+        variantOptions.outputPath = BuildVariantOutputPath(options, variantIndex);
+        variantOptions.artifactDir = BuildVariantArtifactDir(options, variantIndex);
+
+        if (options.hasSeed) {
+            variantOptions.hasSeed = true;
+            variantOptions.seed = DeriveSeed(options.seed, static_cast<std::uint64_t>(variantIndex));
+        } else {
+            variantOptions.hasSeed = false;
+            variantOptions.seed = 0;
+        }
+
+        std::cout << "\nVariant " << variantIndex << "/" << options.variants << "\n";
+        RunSummary summary;
+        int exitCode = ExecuteSingleRun(variantOptions, summary);
+        if (exitCode != 0) {
+            return exitCode;
+        }
+
+        if ((!summary.verifyRequested || summary.verifyPass) &&
+            summary.fingerprintMetrics.diversificationScore > bestScore) {
+            bestScore = summary.fingerprintMetrics.diversificationScore;
+            bestIndex = variantIndex - 1;
+        }
+
+        variantSummaries.push_back(std::move(summary));
+    }
+
+    std::string summaryError;
+    std::string summaryRoot = options.artifactDir.empty()
+                                  ? (std::filesystem::path("build") / "variants" / SafeFileStem(options.outputPath)).string()
+                                  : options.artifactDir;
+    if (!EnsureDirectory(summaryRoot, summaryError)) {
+        std::cerr << summaryError << "\n";
+        return 1;
+    }
+
+    std::filesystem::path summaryPath = std::filesystem::path(summaryRoot) / "variant_summary.md";
+    bool chooseBest = options.selectBestVariant;
+    if (!WriteTextFile(summaryPath.string(),
+                       BuildVariantSummaryMarkdown(variantSummaries, bestIndex, chooseBest),
+                       summaryError)) {
+        std::cerr << summaryError << "\n";
+        return 1;
+    }
+
+    std::cout << "\nVariant Summary\n";
+    std::cout << "---------------\n";
+    for (std::size_t i = 0; i < variantSummaries.size(); ++i) {
+        std::cout << "Variant " << (i + 1) << " score        : "
+                  << std::fixed << std::setprecision(2)
+                  << variantSummaries[i].fingerprintMetrics.diversificationScore << "\n";
+        std::cout << "Variant " << (i + 1) << " artifacts    : "
+                  << variantSummaries[i].artifactDir << "\n";
+    }
+    std::cout << std::defaultfloat;
+    if (chooseBest && bestIndex >= 0) {
+        std::cout << "Selected best variant    : " << (bestIndex + 1) << "\n";
+        std::cout << "Selected output path     : " << variantSummaries[bestIndex].outputPath << "\n";
+    }
+    std::cout << "Variant summary file     : " << summaryPath.string() << "\n";
 
     return 0;
 }
@@ -1746,7 +2857,6 @@ int RunInteractiveSession(const Options& baseOptions) {
             run.seed = 0;
         }
 
-        run.enableLlmSubstitution = PromptYesNo("Enable LLM-assisted substitution", false);
         run.enableLlmExplanation = PromptYesNo("Enable LLM explanation/report", false);
 
         bool saveMarkdown = PromptYesNo("Write markdown report", run.enableLlmExplanation);
@@ -1801,6 +2911,10 @@ int main(int argc, char** argv) {
 
     if (options.interactive) {
         return RunInteractiveSession(options);
+    }
+
+    if (options.variants > 1) {
+        return ExecuteVariantRuns(options);
     }
 
     if (options.runs > 1) {

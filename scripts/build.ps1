@@ -86,6 +86,11 @@ if (-not $sourceFiles) {
 
 $outputPath = Join-Path $buildDir $OutputName
 $flags = @("-std=c++17", "-O2", "-Wall", "-Wextra", "-pedantic")
+$runtimeDlls = @(
+    "libstdc++-6.dll",
+    "libgcc_s_seh-1.dll",
+    "libwinpthread-1.dll"
+)
 
 Write-Host "Compiling with $compilerPath"
 Write-Host "Source files: $($sourceFiles.Count)"
@@ -94,6 +99,17 @@ Write-Host "Source files: $($sourceFiles.Count)"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Compilation failed"
     exit $LASTEXITCODE
+}
+
+foreach ($dllName in $runtimeDlls) {
+    $dllSource = Join-Path $CompilerBinPath $dllName
+    if (Test-Path -Path $dllSource -PathType Leaf) {
+        try {
+            Copy-Item -Path $dllSource -Destination (Join-Path $buildDir $dllName) -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not copy runtime DLL $dllName. The existing file may be locked by a running process."
+        }
+    }
 }
 
 Write-Host "Build successful: $outputPath"
